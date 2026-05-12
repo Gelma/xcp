@@ -55,7 +55,7 @@ This is a Cargo workspace with three crates:
 
 ## Architecture: Copy Flow
 
-`main()` → validates args → builds `Arc<Config>` → `load_driver()` → spawns a thread calling `driver.copy(sources, dest, stats)` → main thread iterates `stat_rx` channel receiving `StatusUpdate::{Size, Copied, Error}` → updates progress bar.
+`main()` → validates args → builds `Arc<Config>` → `load_driver()` → spawns a thread calling `driver.copy(sources, dest, stats)` → main thread iterates `stat_rx` channel receiving `StatusUpdate::{Size, Copied, Error, Notice}` → updates progress bar or prints notice.
 
 Drivers send `StatusUpdate` messages through the `StatusUpdater` trait; `ChannelUpdater` batches small `Copied` updates to avoid channel saturation (grouping by `block_size`).
 
@@ -79,6 +79,7 @@ Implemented in `libxcp/src/operations.rs` as `sync_walker()` and `parallel_delet
 | `--special` | `copy_special` | Sync special files (char/block devices, sockets, FIFOs). Without this flag, special files are skipped in `--sync`. Also enables block-device copying in normal mode. |
 | `--xattrs` | `copy_xattrs` | Update extended attributes (incl. POSIX ACLs on Linux) for files that are otherwise unchanged. `sync_xattrs()` in `libfs` handles path-based xattr diff/apply. |
 | `--sync-full` | (aggregate) | Implies `--sync --hardlinks --special --xattrs --ownership`. Handled in `Config::from(&Opts)`. |
+| `--dry-run` | `dry_run` | Print every planned action (`would copy`, `would delete`, `would create dir`, etc.) without modifying any files. Actions are emitted as `StatusUpdate::Notice(String)` so the library stays I/O-free; the binary prints them. All write paths in `sync_walker` are gated on `!config.dry_run`; `parallel_delete` and `sync_dir_timestamps` are skipped entirely. Requires `--sync` or `--sync-full`. |
 
 ## Feature Flags
 
