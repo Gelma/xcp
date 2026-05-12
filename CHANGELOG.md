@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(xcp)* `--sync` now correctly overwrites read-only destination files (e.g. `0444`); the owner write bit is temporarily added before the copy and the correct permissions are restored from the source afterwards.
 - *(xcp)* `--sync` now correctly handles type conflicts: if a path is a directory in the source but a file/symlink in the destination (or vice versa), the destination entry is replaced with the correct type.
 
+### <!-- 4 -->Performance
+
+- *(xcp)* `--sync` deletion of stale destination entries is now parallelised across `num_cpus` worker threads; independent subtree roots are distributed via a channel and each removed with `remove_dir_all`, eliminating the previous sequential leaf-by-leaf pass.
+
 ### <!-- 0 -->Added
 
 - *(xcp)* New `--sync` option to mirror a source directory onto a destination: copies new or changed files (compared by mtime + size + permissions), recreates symlinks whose target changed, and deletes destination entries absent from the source. Equivalent to `rsync` without block-level deltas. Incompatible with `--no-clobber`; requires exactly one source directory.
