@@ -40,12 +40,12 @@ This is a Cargo workspace with three crates:
 
 - **`xcp/`** (root) — the `xcp` binary: CLI parsing (`src/options.rs`), argument validation, glob expansion, progress bar rendering (`src/progress.rs`), and the main copy loop that threads the driver call and collects `StatusUpdate` messages.
 - **`libxcp/`** — the copy engine library:
-  - `config.rs` — `Config` struct (workers, block_size, reflink mode, backup mode, etc.)
+  - `config.rs` — `Config` struct (workers, block_size, reflink mode, backup mode, sync, etc.)
   - `drivers/` — pluggable driver trait (`CopyDriver`) with two implementations:
     - `parfile` (default): parallelises at the file level
     - `parblock` (feature-gated): parallelises at the block level
   - `feedback.rs` — `StatusUpdater` trait + `ChannelUpdater` (crossbeam channel) + `NoopUpdater`
-  - `operations.rs` — per-file copy logic used by drivers
+  - `operations.rs` — per-file copy logic (`CopyHandle`, `tree_walker`, `sync_walker`)
   - `paths.rs` — source/destination path resolution
   - `backup.rs` — numbered backup file logic
 - **`libfs/`** — low-level filesystem primitives:
@@ -58,6 +58,17 @@ This is a Cargo workspace with three crates:
 `main()` → validates args → builds `Arc<Config>` → `load_driver()` → spawns a thread calling `driver.copy(sources, dest, stats)` → main thread iterates `stat_rx` channel receiving `StatusUpdate::{Size, Copied, Error}` → updates progress bar.
 
 Drivers send `StatusUpdate` messages through the `StatusUpdater` trait; `ChannelUpdater` batches small `Copied` updates to avoid channel saturation (grouping by `block_size`).
+
+## `--sync` mode
+
+`xcp --sync src/ dst/` makes `dst/` identical to `src/` without rsync-style block deltas:
+
+- **skip** files where mtime (nanosecond precision) + size + permissions all match
+- **copy** files that are new or changed
+- **recreate** symlinks whose target changed
+- **delete** destination entries absent from the source (directories walked `contents_first`)
+
+Implemented in `libxcp/src/operations.rs` as `sync_walker()`, called by the `parfile` driver when `Config::sync` is true. Incompatible with `--no-clobber`; requires exactly one source directory.
 
 ## Feature Flags
 
