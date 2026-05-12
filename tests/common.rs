@@ -1769,6 +1769,34 @@ fn sync_skips_unchanged_file() {
 }
 
 #[test]
+#[cfg_attr(feature = "test_no_perms", ignore = "No FS support")]
+fn sync_overwrites_readonly_file() {
+    // A read-only file in dest that differs from source must be
+    // overwritten, and the final permissions must match the source.
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_dir_all(&dst).unwrap();
+
+    create_file(&src.join("ro.txt"), "new content").unwrap();
+    set_permissions(&src.join("ro.txt"), Permissions::from_mode(0o444)).unwrap();
+
+    // Place a read-only file in dst with different (shorter) content so
+    // sync detects a size mismatch and tries to overwrite it.
+    create_file(&dst.join("ro.txt"), "old").unwrap();
+    set_permissions(&dst.join("ro.txt"), Permissions::from_mode(0o444)).unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(file_contains(&dst.join("ro.txt"), "new content").unwrap());
+    // Permissions must be copied from source: still 0444.
+    let mode = dst.join("ro.txt").metadata().unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o444);
+}
+
+#[test]
 #[cfg_attr(feature = "test_no_symlinks", ignore = "No FS support")]
 fn sync_creates_symlink() {
     let dir = tempdir_rel().unwrap();

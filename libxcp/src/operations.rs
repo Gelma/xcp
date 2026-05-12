@@ -15,7 +15,7 @@
  */
 
 use std::collections::HashSet;
-use std::os::unix::fs::{chown, MetadataExt};
+use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 use std::{cmp, thread};
 use std::fs::{self, canonicalize, create_dir_all, read_link, File, Metadata};
 use std::path::{Path, PathBuf};
@@ -367,6 +367,17 @@ pub fn sync_walker(
                     }
                 };
                 if should_copy {
+                    // If the existing destination file is not writable,
+                    // add the owner write bit so File::create() can
+                    // overwrite it. copy_permissions() will restore the
+                    // correct permissions once the copy is complete.
+                    if let Ok(dst_meta) = target.symlink_metadata() {
+                        if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
+                            let mut perms = dst_meta.permissions();
+                            perms.set_mode(dst_meta.mode() | 0o200);
+                            fs::set_permissions(&target, perms)?;
+                        }
+                    }
                     debug!("Sync: copy {from:?} -> {target:?}");
                     stats.send(StatusUpdate::Size(meta.len()))?;
                     work_tx.send(Operation::Copy(from, target))?;
