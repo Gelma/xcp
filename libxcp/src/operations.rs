@@ -431,11 +431,13 @@ pub fn sync_walker(
         }
     }
 
-    // Delete destination entries absent from source. Walk contents-first so
-    // child entries are removed before their parent directories.
+    // Delete destination entries absent from source. Collect all such paths,
+    // then identify the subtree roots — paths whose parent is not also being
+    // deleted — and remove each root in parallel using remove_dir_all.
+    // This avoids the contents-first ordering constraint and lets multiple
+    // independent subtrees be removed concurrently.
     if dest.is_dir() {
-        let to_delete: Vec<PathBuf> = WalkDir::new(dest)
-            .contents_first(true)
+        let all_to_delete: Vec<PathBuf> = WalkDir::new(dest)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -448,16 +450,60 @@ pub fn sync_walker(
             .map(|e| e.into_path())
             .collect();
 
-        for path in to_delete {
-            debug!("Sync: delete {path:?}");
-            match path.symlink_metadata() {
-                Err(_) => continue, // already gone
-                Ok(m) if m.is_dir() => fs::remove_dir(&path)?,
-                Ok(_) => fs::remove_file(&path)?,
-            }
+        if !all_to_delete.is_empty() {
+            // Keep only the top-most paths so remove_dir_all handles subtrees.
+            let delete_set: HashSet<&Path> = all_to_delete.iter().map(PathBuf::as_path).collect();
+            let roots: Vec<PathBuf> = all_to_delete
+                .iter()
+                .filter(|p| {
+                    p.parent()
+                        .map(|parent| !delete_set.contains(parent))
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+
+            parallel_delete(roots, config.num_workers())?;
         }
     }
 
     debug!("Sync walk-worker finished: {:?}", thread::current().id());
+    Ok(())
+}
+
+/// Delete `roots` in parallel across `nworkers` threads. Each root is removed
+/// with `remove_dir_all` (directories) or `remove_file` (files/symlinks), so
+/// callers must pass only subtree roots — not individual descendants.
+fn parallel_delete(roots: Vec<PathBuf>, nworkers: usize) -> Result<()> {
+    let (tx, rx) = cbc::unbounded::<PathBuf>();
+
+    let handles: Vec<_> = (0..nworkers)
+        .map(|_| {
+            let wrx = rx.clone();
+            thread::spawn(move || -> Result<()> {
+                for path in wrx {
+                    debug!("Sync: delete {path:?}");
+                    match path.symlink_metadata() {
+                        Err(_) => {} // already gone
+                        Ok(m) if m.is_dir() => fs::remove_dir_all(&path)?,
+                        Ok(_) => fs::remove_file(&path)?,
+                    }
+                }
+                Ok(())
+            })
+        })
+        .collect();
+
+    for path in roots {
+        tx.send(path)
+            .map_err(|_| XcpError::CopyError("Delete worker disconnected".to_string()))?;
+    }
+    drop(tx);
+
+    for handle in handles {
+        handle.join()
+            .map_err(|_| XcpError::CopyError("Error in parallel delete".to_string()))??;
+    }
+
     Ok(())
 }
