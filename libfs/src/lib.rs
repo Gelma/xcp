@@ -50,6 +50,7 @@ pub use common::{
     is_same_file,
     merge_extents,
     sync,
+    sync_xattrs,
 };
 pub use errors::Error;
 

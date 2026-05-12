@@ -167,6 +167,37 @@ pub struct Opts {
     #[arg(long)]
     pub sync: bool,
 
+    /// Preserve hard links in sync mode.
+    ///
+    /// Detect files that share the same inode in the source and recreate
+    /// the same link structure in the destination. Requires --sync.
+    #[arg(long)]
+    pub hardlinks: bool,
+
+    /// Copy special files in sync mode.
+    ///
+    /// Sync character devices, block devices, sockets, and FIFOs.
+    /// Block devices require appropriate capabilities (usually root).
+    /// Without this flag, special files are skipped during --sync.
+    /// In normal copy mode, enables copying of block devices.
+    #[arg(long)]
+    pub special: bool,
+
+    /// Synchronise extended attributes and ACLs.
+    ///
+    /// In sync mode, update xattrs (including POSIX ACLs, which are
+    /// stored as xattrs on Linux) even for files that are otherwise
+    /// unchanged (same mtime, size, and permissions). Requires --sync.
+    #[arg(long)]
+    pub xattrs: bool,
+
+    /// Full sync: enable all sync-related flags at once.
+    ///
+    /// Equivalent to --sync --hardlinks --special --xattrs --ownership.
+    /// Implies --sync; --sync need not be specified separately.
+    #[arg(long)]
+    pub sync_full: bool,
+
     /// Path list.
     ///
     /// Source and destination files, or multiple source(s) to a directory.
@@ -190,6 +221,7 @@ impl Opts {
 
 impl From<&Opts> for Config {
     fn from(opts: &Opts) -> Self {
+        let sync_full = opts.sync_full;
         Config {
             workers: if opts.workers == 0 {
                 num_cpus::get()
@@ -205,13 +237,16 @@ impl From<&Opts> for Config {
             no_clobber: opts.no_clobber,
             no_perms: opts.no_perms,
             no_timestamps: opts.no_timestamps,
-            ownership: opts.ownership,
+            ownership: opts.ownership || sync_full,
             dereference: opts.dereference,
             no_target_directory: opts.no_target_directory,
             fsync: opts.fsync,
             reflink: opts.reflink,
             backup: opts.backup,
-            sync: opts.sync,
+            sync: opts.sync || sync_full,
+            preserve_hardlinks: opts.hardlinks || sync_full,
+            copy_special: opts.special || sync_full,
+            copy_xattrs: opts.xattrs || sync_full,
         }
     }
 }

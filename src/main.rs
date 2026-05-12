@@ -88,8 +88,15 @@ fn opts_check(opts: &Opts) -> Result<()> {
     if opts.no_clobber && opts.force {
         return Err(XcpError::InvalidArguments("--force and --noclobber cannot be set at the same time.".to_string()).into());
     }
+    let effective_sync = opts.sync || opts.sync_full;
     if opts.sync && opts.no_clobber {
         return Err(XcpError::InvalidArguments("--sync and --no-clobber cannot be set at the same time.".to_string()).into());
+    }
+    if opts.hardlinks && !effective_sync {
+        return Err(XcpError::InvalidArguments("--hardlinks requires --sync or --sync-full".to_string()).into());
+    }
+    if opts.xattrs && !effective_sync {
+        return Err(XcpError::InvalidArguments("--xattrs requires --sync or --sync-full".to_string()).into());
     }
     Ok(())
 }
@@ -108,9 +115,10 @@ fn main() -> Result<()> {
     let dest = PathBuf::from(dest);
 
     let sources = expand_sources(source_patterns, &opts)?;
+    let effective_sync = opts.sync || opts.sync_full;
     if sources.is_empty() {
         return Err(XcpError::InvalidSource("No source files found.").into());
-    } else if !opts.sync && !dest.is_dir() {
+    } else if !effective_sync && !dest.is_dir() {
         if sources.len() == 1 && sources[0].is_dir() && dest.exists() {
             return Err(XcpError::InvalidDestination("Cannot copy a directory to a file.").into());
         } else if sources.len() > 1 {
@@ -119,7 +127,7 @@ fn main() -> Result<()> {
     }
 
     // Sanity-check all sources up-front
-    if opts.sync {
+    if effective_sync {
         if sources.len() != 1 {
             return Err(XcpError::InvalidArguments("--sync requires exactly one source directory".to_string()).into());
         }

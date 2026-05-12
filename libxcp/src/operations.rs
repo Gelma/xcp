@@ -14,7 +14,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 use std::{cmp, thread};
 use std::fs::{self, canonicalize, create_dir_all, read_link, File, Metadata};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crossbeam_channel as cbc;
 use libfs::{
-    allocate_file, copy_file_bytes, copy_owner, copy_permissions, copy_timestamps, next_sparse_segments, probably_sparse, reflink, sync, FileType
+    allocate_file, copy_file_bytes, copy_owner, copy_permissions, copy_timestamps, next_sparse_segments, probably_sparse, reflink, sync, sync_xattrs, FileType
 };
 use log::{debug, error, info, warn};
 use walkdir::WalkDir;
@@ -251,7 +251,17 @@ pub fn tree_walker(
                     work_tx.send(Operation::Special(from, target))?;
                 }
 
-                FileType::Block | FileType::Other => {
+                FileType::Block => {
+                    if config.copy_special {
+                        debug!("Block device found: {from:?} to {target:?}");
+                        work_tx.send(Operation::Special(from, target))?;
+                    } else {
+                        error!("Block device found but --special not set: {target:?}");
+                        return Err(XcpError::UnknownFileType(target).into());
+                    }
+                }
+
+                FileType::Other => {
                     error!("Unsupported filetype found: {target:?} -> {ft:?}");
                     return Err(XcpError::UnknownFileType(target).into());
                 }
@@ -289,7 +299,7 @@ fn needs_copy(src: &Metadata, dst: &Metadata, config: &Config) -> bool {
 pub fn sync_walker(
     source: &Path,
     dest: &Path,
-    config: &Config,
+    config: &Arc<Config>,
     work_tx: cbc::Sender<Operation>,
     stats: Arc<dyn StatusUpdater>,
 ) -> Result<()> {
@@ -300,6 +310,8 @@ pub fn sync_walker(
     }
 
     let mut source_relpaths: HashSet<PathBuf> = HashSet::new();
+    // Maps (dev, ino) of hard-linked source files to the first dest path written.
+    let mut hardlink_map: HashMap<(u64, u64), PathBuf> = HashMap::new();
     let gitignore = parse_ignore(source, config)?;
 
     for entry in WalkDir::new(source)
@@ -359,40 +371,121 @@ pub fn sync_walker(
                         }
                     }
                 }
+                if config.copy_xattrs {
+                    if let Err(e) = sync_xattrs(&from, &target) {
+                        warn!("Failed to sync xattrs for directory {from:?}: {e}");
+                    }
+                }
             }
 
             FileType::File => {
-                let should_copy = match target.symlink_metadata() {
-                    Err(_) => true,
-                    Ok(dst_meta) => {
-                        if dst_meta.file_type().is_dir() {
-                            fs::remove_dir_all(&target)?;
-                            true
-                        } else if dst_meta.file_type().is_symlink() {
-                            fs::remove_file(&target)?;
-                            true
+                if config.preserve_hardlinks && meta.nlink() > 1 {
+                    let key = (meta.dev(), meta.ino());
+                    if let Some(first_dest) = hardlink_map.get(&key).cloned() {
+                        // Subsequent occurrence of the same inode: ensure dest is
+                        // a hard link to first_dest, handling any type conflicts.
+                        let needs_relink = match target.symlink_metadata() {
+                            Err(_) => true, // target absent
+                            Ok(dst_meta) if !dst_meta.file_type().is_file() => true, // wrong type (dir or symlink)
+                            Ok(dst_meta) => match first_dest.symlink_metadata() {
+                                Ok(fd_meta) => {
+                                    dst_meta.ino() != fd_meta.ino()
+                                        || dst_meta.dev() != fd_meta.dev()
+                                }
+                                Err(_) => true, // first_dest gone
+                            },
+                        };
+                        if needs_relink {
+                            if let Ok(m) = target.symlink_metadata() {
+                                if m.file_type().is_dir() {
+                                    fs::remove_dir_all(&target)?;
+                                } else {
+                                    fs::remove_file(&target)?;
+                                }
+                            }
+                            debug!("Sync: hard-link {first_dest:?} -> {target:?}");
+                            fs::hard_link(&first_dest, &target)?;
                         } else {
-                            needs_copy(&meta, &dst_meta, config)
+                            debug!("Sync: skip unchanged hard-link {from:?}");
+                        }
+                    } else {
+                        // First occurrence of this inode: copy synchronously so
+                        // subsequent occurrences can hard-link to it immediately.
+                        hardlink_map.insert(key, target.clone());
+                        let should_copy = match target.symlink_metadata() {
+                            Err(_) => true,
+                            Ok(dst_meta) => {
+                                if dst_meta.file_type().is_dir() {
+                                    fs::remove_dir_all(&target)?;
+                                    true
+                                } else if dst_meta.file_type().is_symlink() {
+                                    fs::remove_file(&target)?;
+                                    true
+                                } else {
+                                    needs_copy(&meta, &dst_meta, config)
+                                }
+                            }
+                        };
+                        if should_copy {
+                            if let Ok(dst_meta) = target.symlink_metadata() {
+                                if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
+                                    let mut perms = dst_meta.permissions();
+                                    perms.set_mode(dst_meta.mode() | 0o200);
+                                    fs::set_permissions(&target, perms)?;
+                                }
+                            }
+                            debug!("Sync: copy (hard-link first) {from:?} -> {target:?}");
+                            stats.send(StatusUpdate::Size(meta.len()))?;
+                            let hdl = CopyHandle::new(&from, &target, config)?;
+                            hdl.copy_file(&stats)?;
+                        } else {
+                            if config.copy_xattrs {
+                                if let Err(e) = sync_xattrs(&from, &target) {
+                                    warn!("Failed to sync xattrs {from:?}: {e}");
+                                }
+                            }
+                            debug!("Sync: skip unchanged (hard-link first) {from:?}");
                         }
                     }
-                };
-                if should_copy {
-                    // If the existing destination file is not writable,
-                    // add the owner write bit so File::create() can
-                    // overwrite it. copy_permissions() will restore the
-                    // correct permissions once the copy is complete.
-                    if let Ok(dst_meta) = target.symlink_metadata() {
-                        if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
-                            let mut perms = dst_meta.permissions();
-                            perms.set_mode(dst_meta.mode() | 0o200);
-                            fs::set_permissions(&target, perms)?;
-                        }
-                    }
-                    debug!("Sync: copy {from:?} -> {target:?}");
-                    stats.send(StatusUpdate::Size(meta.len()))?;
-                    work_tx.send(Operation::Copy(from, target))?;
                 } else {
-                    debug!("Sync: skip unchanged {from:?}");
+                    // Regular file (no hard-link preservation).
+                    let should_copy = match target.symlink_metadata() {
+                        Err(_) => true,
+                        Ok(dst_meta) => {
+                            if dst_meta.file_type().is_dir() {
+                                fs::remove_dir_all(&target)?;
+                                true
+                            } else if dst_meta.file_type().is_symlink() {
+                                fs::remove_file(&target)?;
+                                true
+                            } else {
+                                needs_copy(&meta, &dst_meta, config)
+                            }
+                        }
+                    };
+                    if should_copy {
+                        // If the existing destination file is not writable,
+                        // add the owner write bit so File::create() can
+                        // overwrite it. copy_permissions() will restore the
+                        // correct permissions once the copy is complete.
+                        if let Ok(dst_meta) = target.symlink_metadata() {
+                            if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
+                                let mut perms = dst_meta.permissions();
+                                perms.set_mode(dst_meta.mode() | 0o200);
+                                fs::set_permissions(&target, perms)?;
+                            }
+                        }
+                        debug!("Sync: copy {from:?} -> {target:?}");
+                        stats.send(StatusUpdate::Size(meta.len()))?;
+                        work_tx.send(Operation::Copy(from, target))?;
+                    } else {
+                        if config.copy_xattrs {
+                            if let Err(e) = sync_xattrs(&from, &target) {
+                                warn!("Failed to sync xattrs {from:?}: {e}");
+                            }
+                        }
+                        debug!("Sync: skip unchanged {from:?}");
+                    }
                 }
             }
 
@@ -410,7 +503,11 @@ pub fn sync_walker(
                 };
                 if should_link {
                     if target.symlink_metadata().is_ok() {
-                        fs::remove_file(&target)?;
+                        if target.symlink_metadata().map(|m| m.file_type().is_dir()).unwrap_or(false) {
+                            fs::remove_dir_all(&target)?;
+                        } else {
+                            fs::remove_file(&target)?;
+                        }
                     }
                     debug!("Sync: symlink {link_target:?} -> {target:?}");
                     work_tx.send(Operation::Link(link_target, target))?;
@@ -420,11 +517,24 @@ pub fn sync_walker(
             }
 
             FileType::Socket | FileType::Char | FileType::Fifo => {
-                debug!("Sync: special file {from:?} -> {target:?}");
-                work_tx.send(Operation::Special(from, target))?;
+                if config.copy_special {
+                    debug!("Sync: special file {from:?} -> {target:?}");
+                    work_tx.send(Operation::Special(from, target))?;
+                } else {
+                    debug!("Sync: skip special file {from:?}");
+                }
             }
 
-            FileType::Block | FileType::Other => {
+            FileType::Block => {
+                if config.copy_special {
+                    debug!("Sync: block device {from:?} -> {target:?}");
+                    work_tx.send(Operation::Special(from, target))?;
+                } else {
+                    debug!("Sync: skip block device {from:?}");
+                }
+            }
+
+            FileType::Other => {
                 error!("Unsupported filetype found: {target:?} -> {ft:?}");
                 return Err(XcpError::UnknownFileType(target).into());
             }

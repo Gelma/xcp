@@ -71,6 +71,15 @@ Drivers send `StatusUpdate` messages through the `StatusUpdater` trait; `Channel
 
 Implemented in `libxcp/src/operations.rs` as `sync_walker()` and `parallel_delete()`, called by the `parfile` driver when `Config::sync` is true. Incompatible with `--no-clobber`; requires exactly one source directory.
 
+### `--sync`-related flags
+
+| Flag | Config field | Effect |
+|---|---|---|
+| `--hardlinks` | `preserve_hardlinks` | Detect shared inodes in source; recreate hard-link groups in dest. First occurrence is copied synchronously (walker thread) so subsequent links can be created immediately. Type conflicts at dest (symlink/dir where a link is expected) are removed first. |
+| `--special` | `copy_special` | Sync special files (char/block devices, sockets, FIFOs). Without this flag, special files are skipped in `--sync`. Also enables block-device copying in normal mode. |
+| `--xattrs` | `copy_xattrs` | Update extended attributes (incl. POSIX ACLs on Linux) for files that are otherwise unchanged. `sync_xattrs()` in `libfs` handles path-based xattr diff/apply. |
+| `--sync-full` | (aggregate) | Implies `--sync --hardlinks --special --xattrs --ownership`. Handled in `Config::from(&Opts)`. |
+
 ## Feature Flags
 
 - `use_linux` — enables Linux-specific copy syscalls (`copy_file_range`, ioctl reflink); on by default

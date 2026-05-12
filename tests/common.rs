@@ -14,7 +14,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::fs::{create_dir_all, remove_file, set_permissions, write, File, FileTimes, Permissions};
+use std::fs::{self, create_dir_all, remove_file, set_permissions, write, File, FileTimes, Permissions};
 use std::os::unix::fs::{chown, symlink, PermissionsExt, MetadataExt};
 use std::os::unix::net::UnixListener;
 use cfg_if::cfg_if;
@@ -1882,4 +1882,224 @@ fn sync_updates_changed_symlink() {
         dst.join("link.txt").read_link().unwrap(),
         std::path::Path::new("b.txt")
     );
+}
+
+// ===== --hardlinks tests =====
+
+#[test]
+fn sync_preserves_hardlinks() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+
+    create_file(&src.join("file1.txt"), "shared content").unwrap();
+    fs::hard_link(src.join("file1.txt"), src.join("file2.txt")).unwrap();
+
+    let m = src.join("file1.txt").symlink_metadata().unwrap();
+    assert_eq!(m.nlink(), 2);
+
+    let out = run(&[
+        "--sync", "--hardlinks",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(out.status.success());
+    let m1 = dst.join("file1.txt").symlink_metadata().unwrap();
+    let m2 = dst.join("file2.txt").symlink_metadata().unwrap();
+    assert_eq!(m1.ino(), m2.ino(), "file1 and file2 must share an inode");
+    assert_eq!(m1.dev(), m2.dev());
+}
+
+#[test]
+#[cfg_attr(feature = "test_no_symlinks", ignore = "No FS support")]
+fn sync_hardlinks_replaces_symlink_in_dest() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_dir_all(&dst).unwrap();
+
+    create_file(&src.join("file1.txt"), "content").unwrap();
+    fs::hard_link(src.join("file1.txt"), src.join("file2.txt")).unwrap();
+
+    // Pre-existing dest: file1 is a regular file, file2 is a symlink.
+    create_file(&dst.join("file1.txt"), "content").unwrap();
+    symlink("file1.txt", dst.join("file2.txt")).unwrap();
+
+    let out = run(&[
+        "--sync", "--hardlinks",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(out.status.success());
+    let m1 = dst.join("file1.txt").symlink_metadata().unwrap();
+    let m2 = dst.join("file2.txt").symlink_metadata().unwrap();
+    assert!(!m2.file_type().is_symlink(), "file2 must be a regular file, not a symlink");
+    assert_eq!(m1.ino(), m2.ino(), "file1 and file2 must share an inode");
+}
+
+#[test]
+fn sync_hardlinks_replaces_dir_in_dest() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_dir_all(&dst).unwrap();
+
+    create_file(&src.join("file1.txt"), "content").unwrap();
+    fs::hard_link(src.join("file1.txt"), src.join("file2.txt")).unwrap();
+
+    // Pre-existing dest: file1 is a regular file, file2 is a directory.
+    create_file(&dst.join("file1.txt"), "content").unwrap();
+    create_dir_all(dst.join("file2.txt")).unwrap();
+
+    let out = run(&[
+        "--sync", "--hardlinks",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(out.status.success());
+    let m1 = dst.join("file1.txt").symlink_metadata().unwrap();
+    let m2 = dst.join("file2.txt").symlink_metadata().unwrap();
+    assert!(m2.file_type().is_file(), "file2 must be a regular file, not a directory");
+    assert_eq!(m1.ino(), m2.ino(), "file1 and file2 must share an inode");
+}
+
+#[test]
+fn sync_hardlinks_requires_sync_flag() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("file.txt");
+    let dst = dir.path().join("dst.txt");
+    create_file(&src, "x").unwrap();
+
+    let out = run(&["--hardlinks", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("--hardlinks requires --sync"));
+}
+
+// ===== --special tests =====
+
+#[test]
+#[cfg_attr(feature = "test_no_sockets", ignore = "No FS support")]
+fn sync_special_skipped_by_default() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+
+    let _sock = UnixListener::bind(src.join("sock.s")).unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(!dst.join("sock.s").exists(), "socket must be skipped without --special");
+}
+
+#[test]
+#[cfg_attr(feature = "test_no_sockets", ignore = "No FS support")]
+fn sync_special_copies_socket_with_flag() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+
+    let _sock = UnixListener::bind(src.join("sock.s")).unwrap();
+
+    let out = run(&[
+        "--sync", "--special",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(out.status.success());
+    assert!(dst.join("sock.s").exists(), "socket must be created with --special");
+    let ft = dst.join("sock.s").symlink_metadata().unwrap().file_type();
+    assert!(!ft.is_file() && !ft.is_dir() && !ft.is_symlink());
+}
+
+// ===== --xattrs tests =====
+
+#[test]
+#[cfg_attr(feature = "test_no_xattr", ignore = "No FS support")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn sync_xattrs_syncs_unchanged_file() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "v1").unwrap();
+
+    // Initial sync: copies file and its (empty) xattrs.
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    // Set xattr on source, keep mtime/size unchanged so the file looks identical.
+    xattr::set(src.join("f.txt"), "user.sync_test", b"value1").unwrap();
+    let saved = dst.join("f.txt").metadata().unwrap().modified().unwrap();
+    // Touch src mtime back to match dst so needs_copy returns false.
+    let ft = FileTimes::new().set_modified(saved);
+    File::open(src.join("f.txt")).unwrap().set_times(ft).unwrap();
+
+    // Sync without --xattrs: xattr NOT propagated (file skipped).
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        xattr::get(dst.join("f.txt"), "user.sync_test").unwrap(),
+        None,
+        "xattr must not be copied without --xattrs"
+    );
+
+    // Sync with --xattrs: xattr propagated even though file is "unchanged".
+    let out = run(&[
+        "--sync", "--xattrs",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        xattr::get(dst.join("f.txt"), "user.sync_test").unwrap().unwrap(),
+        b"value1",
+        "xattr must be synced with --xattrs"
+    );
+}
+
+// ===== --sync-full tests =====
+
+#[test]
+fn sync_full_implies_sync() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("a.txt"), "hello").unwrap();
+
+    // --sync-full without explicit --sync must still work.
+    let out = run(&["--sync-full", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(file_contains(&dst.join("a.txt"), "hello").unwrap());
+}
+
+#[test]
+fn sync_full_enables_hardlinks() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+
+    create_file(&src.join("file1.txt"), "shared").unwrap();
+    fs::hard_link(src.join("file1.txt"), src.join("file2.txt")).unwrap();
+
+    let out = run(&["--sync-full", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    let m1 = dst.join("file1.txt").symlink_metadata().unwrap();
+    let m2 = dst.join("file2.txt").symlink_metadata().unwrap();
+    assert_eq!(m1.ino(), m2.ino(), "--sync-full must preserve hard links");
 }

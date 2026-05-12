@@ -178,6 +178,50 @@ pub fn merge_extents(extents: Vec<Extent>) -> Result<Vec<Extent>> {
 }
 
 
+/// Synchronise xattrs from `src` to `dst` by path. Copies all xattrs present
+/// in `src` to `dst` and removes any xattrs present only in `dst`. Best-effort:
+/// individual failures are logged as warnings rather than propagated. Does nothing
+/// on platforms where xattrs are not supported.
+pub fn sync_xattrs(src: &Path, dst: &Path) -> Result<()> {
+    if !XATTR_SUPPORTED {
+        return Ok(());
+    }
+    use std::collections::HashSet;
+    use std::ffi::OsString;
+
+    let src_attrs: HashSet<OsString> = match xattr::list(src) {
+        Ok(attrs) => attrs.collect(),
+        Err(e) => {
+            warn!("Failed to list xattrs for {src:?}: {e}");
+            return Ok(());
+        }
+    };
+
+    for name in &src_attrs {
+        match xattr::get(src, name) {
+            Ok(Some(val)) => {
+                if let Err(e) = xattr::set(dst, name, &val) {
+                    warn!("Failed to set xattr {name:?} on {dst:?}: {e}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!("Failed to get xattr {name:?} from {src:?}: {e}"),
+        }
+    }
+
+    if let Ok(dst_attrs) = xattr::list(dst) {
+        for name in dst_attrs {
+            if !src_attrs.contains(&name) {
+                if let Err(e) = xattr::remove(dst, &name) {
+                    warn!("Failed to remove xattr {name:?} from {dst:?}: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Determine if two files are the same by examining their inodes.
 pub fn is_same_file(src: &Path, dest: &Path) -> Result<bool> {
     let sstat = src.metadata()?;

@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### <!-- 0 -->Added
 
 - *(xcp)* New `--sync` option to mirror a source directory onto a destination: copies new or changed files (compared by mtime + size + permissions), recreates symlinks whose target changed, and deletes destination entries absent from the source. Equivalent to `rsync` without block-level deltas. Incompatible with `--no-clobber`; requires exactly one source directory.
+- *(xcp)* New `--hardlinks` flag for `--sync`: detects files that share an inode in the source and recreates the same hard-link structure in the destination. Type conflicts at the destination (symlink or directory where a hard link is expected) are resolved automatically.
+- *(xcp)* New `--special` flag: enables copying of special files (character devices, block devices, sockets, FIFOs) during `--sync`. Without this flag, special files are skipped. Also enables block-device copying in normal (non-sync) mode.
+- *(xcp)* New `--xattrs` flag for `--sync`: synchronises extended attributes (including POSIX ACLs, stored as xattrs on Linux) even for files that are otherwise unchanged (same mtime, size, permissions). Requires `--sync`.
+- *(xcp)* New `--sync-full` flag: activates all sync-related options at once (`--sync --hardlinks --special --xattrs --ownership`); implies `--sync` so it need not be specified separately.
 
 ## [0.24.8](https://github.com/tarka/xcp/compare/xcp-v0.24.7...xcp-v0.24.8) - 2026-05-03
 

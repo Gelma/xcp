@@ -152,6 +152,27 @@ pub struct Config {
     /// entries that are no longer present in the source. Comparison
     /// uses mtime + size (and permissions unless `no_perms` is set).
     pub sync: bool,
+
+    /// Preserve hard links in sync mode.
+    ///
+    /// Detect files that share an inode in the source and recreate the
+    /// same link structure in the destination. Only meaningful with
+    /// `sync = true`.
+    pub preserve_hardlinks: bool,
+
+    /// Copy special files in sync mode.
+    ///
+    /// When enabled, character devices, block devices, sockets, and FIFOs
+    /// are included in the sync. When disabled (the default), special files
+    /// are skipped. Block devices also require appropriate capabilities.
+    pub copy_special: bool,
+
+    /// Synchronise extended attributes (xattrs / ACLs) in sync mode.
+    ///
+    /// When enabled, xattrs are updated even for files that are otherwise
+    /// unchanged (same mtime, size, and permissions). ACLs on Linux are
+    /// stored as xattrs and are therefore included automatically.
+    pub copy_xattrs: bool,
 }
 
 impl Config {
@@ -180,6 +201,9 @@ impl Default for Config {
             reflink: Reflink::Auto,
             backup: Backup::None,
             sync: false,
+            preserve_hardlinks: false,
+            copy_special: false,
+            copy_xattrs: false,
         }
     }
 }
