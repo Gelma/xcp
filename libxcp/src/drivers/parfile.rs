@@ -30,7 +30,7 @@ use crate::config::Config;
 use crate::drivers::CopyDriver;
 use crate::errors::{Result, XcpError};
 use crate::feedback::{StatusUpdate, StatusUpdater};
-use crate::operations::{CopyHandle, Operation, tree_walker};
+use crate::operations::{CopyHandle, Operation, sync_walker, tree_walker};
 
 // ********************************************************************** //
 
@@ -57,7 +57,15 @@ impl CopyDriver for Driver {
             let sc = stats.clone();
             let d = dest.to_path_buf();
             let o = self.config.clone();
-            thread::spawn(move || tree_walker(sources, &d, &o, work_tx, sc))
+            thread::spawn(move || {
+                if o.sync {
+                    let source = sources.into_iter().next()
+                        .ok_or(XcpError::InvalidSource("Sync mode requires exactly one source"))?;
+                    sync_walker(&source, &d, &o, work_tx, sc)
+                } else {
+                    tree_walker(sources, &d, &o, work_tx, sc)
+                }
+            })
         };
 
         // Worker threads. Will consume work and then shutdown once the

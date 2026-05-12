@@ -157,6 +157,16 @@ pub struct Opts {
     #[arg(long, default_value = "none")]
     pub backup: Backup,
 
+    /// Sync destination to source.
+    ///
+    /// Make the destination directory identical to the source directory:
+    /// copy new or changed files, update metadata where needed, and delete
+    /// any destination entries that no longer exist in the source.
+    /// Comparison uses mtime + size (and permissions unless --no-perms is
+    /// set). Requires exactly one source directory.
+    #[arg(long)]
+    pub sync: bool,
+
     /// Path list.
     ///
     /// Source and destination files, or multiple source(s) to a directory.
@@ -201,6 +211,7 @@ impl From<&Opts> for Config {
             fsync: opts.fsync,
             reflink: opts.reflink,
             backup: opts.backup,
+            sync: opts.sync,
         }
     }
 }

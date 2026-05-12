@@ -88,6 +88,9 @@ fn opts_check(opts: &Opts) -> Result<()> {
     if opts.no_clobber && opts.force {
         return Err(XcpError::InvalidArguments("--force and --noclobber cannot be set at the same time.".to_string()).into());
     }
+    if opts.sync && opts.no_clobber {
+        return Err(XcpError::InvalidArguments("--sync and --no-clobber cannot be set at the same time.".to_string()).into());
+    }
     Ok(())
 }
 
@@ -116,32 +119,47 @@ fn main() -> Result<()> {
     }
 
     // Sanity-check all sources up-front
-    for source in &sources {
-        info!("Copying source {source:?} to {dest:?}");
-        let metadata = source.symlink_metadata().map_err(|_|
-            XcpError::InvalidSource("Source does not exist, or perhaps you lack permission to access it.")
-        )?;
-
-        if metadata.is_dir() && !opts.recursive {
-            return Err(XcpError::InvalidSource("Source is directory and --recursive not specified.").into());
+    if opts.sync {
+        if sources.len() != 1 {
+            return Err(XcpError::InvalidArguments("--sync requires exactly one source directory".to_string()).into());
         }
-        if source == &dest {
-            return Err(XcpError::InvalidSource("Cannot copy a directory into itself").into());
+        if !sources[0].is_dir() {
+            return Err(XcpError::InvalidArguments("--sync source must be a directory".to_string()).into());
         }
-
-        let sourcedir = source
-            .components()
-            .next_back()
-            .ok_or(XcpError::InvalidSource("Failed to find source directory name."))?;
-
-        let target_base = if dest.exists() && dest.is_dir() && !opts.no_target_directory {
-            dest.join(sourcedir)
-        } else {
-            dest.to_path_buf()
-        };
-
-        if source == &target_base {
+        if dest.exists() && !dest.is_dir() {
+            return Err(XcpError::InvalidArguments("--sync destination must be a directory or must not exist".to_string()).into());
+        }
+        if sources[0] == dest {
             return Err(XcpError::InvalidSource("Source is same as destination").into());
+        }
+    } else {
+        for source in &sources {
+            info!("Copying source {source:?} to {dest:?}");
+            let metadata = source.symlink_metadata().map_err(|_|
+                XcpError::InvalidSource("Source does not exist, or perhaps you lack permission to access it.")
+            )?;
+
+            if metadata.is_dir() && !opts.recursive {
+                return Err(XcpError::InvalidSource("Source is directory and --recursive not specified.").into());
+            }
+            if source == &dest {
+                return Err(XcpError::InvalidSource("Cannot copy a directory into itself").into());
+            }
+
+            let sourcedir = source
+                .components()
+                .next_back()
+                .ok_or(XcpError::InvalidSource("Failed to find source directory name."))?;
+
+            let target_base = if dest.exists() && dest.is_dir() && !opts.no_target_directory {
+                dest.join(sourcedir)
+            } else {
+                dest.to_path_buf()
+            };
+
+            if source == &target_base {
+                return Err(XcpError::InvalidSource("Source is same as destination").into());
+            }
         }
     }
 

@@ -14,6 +14,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use std::collections::HashSet;
 use std::os::unix::fs::{chown, MetadataExt};
 use std::{cmp, thread};
 use std::fs::{self, canonicalize, create_dir_all, read_link, File, Metadata};
@@ -264,4 +265,178 @@ pub fn tree_walker(
 
 fn empty_path(path: &Path) -> bool {
     *path == PathBuf::new()
+}
+
+/// Return true when a source file must be copied over an existing destination
+/// file. Compares mtime (nanosecond precision), size, and optionally permissions.
+fn needs_copy(src: &Metadata, dst: &Metadata, config: &Config) -> bool {
+    if src.len() != dst.len() {
+        return true;
+    }
+    if src.mtime() != dst.mtime() || src.mtime_nsec() != dst.mtime_nsec() {
+        return true;
+    }
+    if !config.no_perms && src.permissions() != dst.permissions() {
+        return true;
+    }
+    false
+}
+
+/// Walk `source`, emitting copy/link/special operations for entries that are
+/// new or changed relative to `dest`, then delete any `dest` entries that are
+/// no longer present in `source`. The combination makes `dest` identical to
+/// `source` without using rsync-style block deltas.
+pub fn sync_walker(
+    source: &Path,
+    dest: &Path,
+    config: &Config,
+    work_tx: cbc::Sender<Operation>,
+    stats: Arc<dyn StatusUpdater>,
+) -> Result<()> {
+    debug!("Starting sync walk worker {:?}", thread::current().id());
+
+    if !dest.exists() {
+        create_dir_all(dest)?;
+    }
+
+    let mut source_relpaths: HashSet<PathBuf> = HashSet::new();
+    let gitignore = parse_ignore(source, config)?;
+
+    for entry in WalkDir::new(source)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|e| ignore_filter(e, &gitignore))
+    {
+        let epath = entry?.into_path();
+        let from = if config.dereference {
+            let cpath = canonicalize(&epath)?;
+            debug!("Dereferencing {epath:?} into {cpath:?}");
+            cpath
+        } else {
+            epath.clone()
+        };
+
+        let meta = from.symlink_metadata()?;
+        let rel = epath.strip_prefix(source)?;
+        source_relpaths.insert(rel.to_path_buf());
+
+        let target = if !empty_path(rel) {
+            dest.join(rel)
+        } else {
+            dest.to_path_buf()
+        };
+
+        let ft = FileType::from(meta.file_type());
+        match ft {
+            FileType::Dir => {
+                if !target.exists() {
+                    debug!("Sync: creating directory {target:?}");
+                    if let Err(err) = create_dir_all(&target) {
+                        let msg = format!("Error creating target directory: {err}");
+                        error!("{msg}");
+                        return Err(XcpError::CopyError(msg).into());
+                    }
+                }
+                if config.ownership {
+                    if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
+                        warn!("Failed to copy directory ownership: {target:?}: {e}");
+                    }
+                }
+                if !config.no_perms {
+                    if let Ok(dst_meta) = target.symlink_metadata() {
+                        if dst_meta.permissions() != meta.permissions() {
+                            fs::set_permissions(&target, meta.permissions())?;
+                        }
+                    }
+                }
+            }
+
+            FileType::File => {
+                let should_copy = match target.symlink_metadata() {
+                    Err(_) => true,
+                    Ok(dst_meta) => {
+                        if dst_meta.file_type().is_dir() {
+                            fs::remove_dir_all(&target)?;
+                            true
+                        } else if dst_meta.file_type().is_symlink() {
+                            fs::remove_file(&target)?;
+                            true
+                        } else {
+                            needs_copy(&meta, &dst_meta, config)
+                        }
+                    }
+                };
+                if should_copy {
+                    debug!("Sync: copy {from:?} -> {target:?}");
+                    stats.send(StatusUpdate::Size(meta.len()))?;
+                    work_tx.send(Operation::Copy(from, target))?;
+                } else {
+                    debug!("Sync: skip unchanged {from:?}");
+                }
+            }
+
+            FileType::Symlink => {
+                let link_target = read_link(&from)?;
+                let should_link = match target.symlink_metadata() {
+                    Err(_) => true,
+                    Ok(dst_meta) => {
+                        if !dst_meta.file_type().is_symlink() {
+                            true
+                        } else {
+                            read_link(&target)? != link_target
+                        }
+                    }
+                };
+                if should_link {
+                    if target.symlink_metadata().is_ok() {
+                        fs::remove_file(&target)?;
+                    }
+                    debug!("Sync: symlink {link_target:?} -> {target:?}");
+                    work_tx.send(Operation::Link(link_target, target))?;
+                } else {
+                    debug!("Sync: skip unchanged symlink {from:?}");
+                }
+            }
+
+            FileType::Socket | FileType::Char | FileType::Fifo => {
+                debug!("Sync: special file {from:?} -> {target:?}");
+                work_tx.send(Operation::Special(from, target))?;
+            }
+
+            FileType::Block | FileType::Other => {
+                error!("Unsupported filetype found: {target:?} -> {ft:?}");
+                return Err(XcpError::UnknownFileType(target).into());
+            }
+        }
+    }
+
+    // Delete destination entries absent from source. Walk contents-first so
+    // child entries are removed before their parent directories.
+    if dest.is_dir() {
+        let to_delete: Vec<PathBuf> = WalkDir::new(dest)
+            .contents_first(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let rel = match e.path().strip_prefix(dest) {
+                    Ok(r) => r,
+                    Err(_) => return false,
+                };
+                !empty_path(rel) && !source_relpaths.contains(rel)
+            })
+            .map(|e| e.into_path())
+            .collect();
+
+        for path in to_delete {
+            debug!("Sync: delete {path:?}");
+            match path.symlink_metadata() {
+                Err(_) => continue, // already gone
+                Ok(m) if m.is_dir() => fs::remove_dir(&path)?,
+                Ok(_) => fs::remove_file(&path)?,
+            }
+        }
+    }
+
+    debug!("Sync walk-worker finished: {:?}", thread::current().id());
+    Ok(())
 }

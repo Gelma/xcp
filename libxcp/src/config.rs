@@ -144,6 +144,14 @@ pub struct Config {
     /// semantics of `cp` numbered backups
     /// (e.g. `file.txt.~123~`). Default is `None`.
     pub backup: Backup,
+
+    /// Sync mode.
+    ///
+    /// Make the destination directory identical to the source: copy
+    /// new or changed files, update metadata, and delete destination
+    /// entries that are no longer present in the source. Comparison
+    /// uses mtime + size (and permissions unless `no_perms` is set).
+    pub sync: bool,
 }
 
 impl Config {
@@ -171,6 +179,7 @@ impl Default for Config {
             fsync: false,
             reflink: Reflink::Auto,
             backup: Backup::None,
+            sync: false,
         }
     }
 }
