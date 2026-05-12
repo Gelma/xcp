@@ -14,7 +14,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::fs::{create_dir_all, set_permissions, write, File, Permissions};
+use std::fs::{create_dir_all, remove_file, set_permissions, write, File, FileTimes, Permissions};
 use std::os::unix::fs::{chown, symlink, PermissionsExt, MetadataExt};
 use std::os::unix::net::UnixListener;
 use cfg_if::cfg_if;
@@ -1541,4 +1541,281 @@ fn file_copy_ownership(drv: &str) {
     assert_eq!(1, dest_int_dir.metadata().unwrap().gid());
     assert_eq!(1, dest_file.metadata().unwrap().uid());
     assert_eq!(1, dest_file.metadata().unwrap().gid());
+}
+
+// ===== --sync tests =====
+
+#[test]
+fn sync_source_must_be_dir() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("file.txt");
+    let dst = dir.path().join("dst");
+    create_file(&src, "content").unwrap();
+    create_dir_all(&dst).unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("source must be a directory"));
+}
+
+#[test]
+fn sync_dest_must_not_be_file() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst.txt");
+    create_dir_all(&src).unwrap();
+    create_file(&dst, "x").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("destination must be a directory"));
+}
+
+#[test]
+fn sync_requires_single_source() {
+    let dir = tempdir_rel().unwrap();
+    let src1 = dir.path().join("src1");
+    let src2 = dir.path().join("src2");
+    let dst  = dir.path().join("dst");
+    create_dir_all(&src1).unwrap();
+    create_dir_all(&src2).unwrap();
+    create_dir_all(&dst).unwrap();
+
+    let out = run(&[
+        "--sync",
+        src1.to_str().unwrap(),
+        src2.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("exactly one source"));
+}
+
+#[test]
+fn sync_same_source_and_dest() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    create_dir_all(&src).unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), src.to_str().unwrap()]).unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("same as destination"));
+}
+
+#[test]
+fn sync_incompatible_with_no_clobber() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_dir_all(&dst).unwrap();
+
+    let out = run(&[
+        "--sync", "--no-clobber",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("--sync and --no-clobber"));
+}
+
+#[test]
+fn sync_creates_new_dest() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst"); // does not exist yet
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("a.txt"), "hello").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(file_contains(&dst.join("a.txt"), "hello").unwrap());
+}
+
+#[test]
+fn sync_copies_tree() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(src.join("sub")).unwrap();
+    create_file(&src.join("a.txt"), "aaa").unwrap();
+    create_file(&src.join("sub/b.txt"), "bbb").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(file_contains(&dst.join("a.txt"), "aaa").unwrap());
+    assert!(file_contains(&dst.join("sub/b.txt"), "bbb").unwrap());
+}
+
+#[test]
+fn sync_deletes_stale_file() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_dir_all(&dst).unwrap();
+    create_file(&src.join("keep.txt"), "keep").unwrap();
+    create_file(&dst.join("stale.txt"), "stale").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(dst.join("keep.txt").exists());
+    assert!(!dst.join("stale.txt").exists());
+}
+
+#[test]
+fn sync_deletes_stale_dir() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    // dst has a directory tree not present in src
+    create_dir_all(dst.join("stale/sub")).unwrap();
+    create_file(&dst.join("stale/file.txt"), "x").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(!dst.join("stale").exists());
+}
+
+#[test]
+fn sync_copies_new_file() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("a.txt"), "aaa").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    // Add a new file to source and sync again.
+    create_file(&src.join("b.txt"), "bbb").unwrap();
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(file_contains(&dst.join("a.txt"), "aaa").unwrap());
+    assert!(file_contains(&dst.join("b.txt"), "bbb").unwrap());
+}
+
+#[test]
+fn sync_updates_changed_file() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "v1").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+    assert!(file_contains(&dst.join("f.txt"), "v1").unwrap());
+
+    // Write different-size content so a size mismatch is guaranteed regardless
+    // of filesystem mtime granularity.
+    write(src.join("f.txt"), "v2_updated_content").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(file_contains(&dst.join("f.txt"), "v2_updated_content").unwrap());
+}
+
+#[test]
+fn sync_skips_unchanged_file() {
+    // Files where src mtime + size match dst must not be re-copied.
+    // Verify this by corrupting the dst content (keeping size and mtime
+    // identical to src) then asserting that a subsequent sync leaves the
+    // corrupted content in place.
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    // Both strings are 2 bytes so size stays the same after we swap content.
+    create_file(&src.join("f.txt"), "v1").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let dst_file = dst.join("f.txt");
+
+    // Record dst mtime (equals src mtime after the first sync).
+    let saved_mtime = dst_file.metadata().unwrap().modified().unwrap();
+
+    // Overwrite dst content with same-size "v2", then restore the mtime so
+    // that xcp sees matching mtime + size and skips the file.
+    write(&dst_file, "v2").unwrap();
+    let ft = FileTimes::new().set_modified(saved_mtime);
+    File::open(&dst_file).unwrap().set_times(ft).unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    // dst must still hold "v2" — proving the file was not re-copied.
+    assert!(file_contains(&dst_file, "v2").unwrap());
+}
+
+#[test]
+#[cfg_attr(feature = "test_no_symlinks", ignore = "No FS support")]
+fn sync_creates_symlink() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("target.txt"), "data").unwrap();
+    symlink("target.txt", src.join("link.txt")).unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    let link_meta = dst.join("link.txt").symlink_metadata().unwrap();
+    assert!(link_meta.file_type().is_symlink());
+    assert_eq!(
+        dst.join("link.txt").read_link().unwrap(),
+        std::path::Path::new("target.txt")
+    );
+}
+
+#[test]
+#[cfg_attr(feature = "test_no_symlinks", ignore = "No FS support")]
+fn sync_updates_changed_symlink() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("a.txt"), "a").unwrap();
+    create_file(&src.join("b.txt"), "b").unwrap();
+    symlink("a.txt", src.join("link.txt")).unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        dst.join("link.txt").read_link().unwrap(),
+        std::path::Path::new("a.txt")
+    );
+
+    // Change the symlink target in source.
+    remove_file(src.join("link.txt")).unwrap();
+    symlink("b.txt", src.join("link.txt")).unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert_eq!(
+        dst.join("link.txt").read_link().unwrap(),
+        std::path::Path::new("b.txt")
+    );
 }

@@ -110,7 +110,7 @@ fn main() -> Result<()> {
     let sources = expand_sources(source_patterns, &opts)?;
     if sources.is_empty() {
         return Err(XcpError::InvalidSource("No source files found.").into());
-    } else if !dest.is_dir() {
+    } else if !opts.sync && !dest.is_dir() {
         if sources.len() == 1 && sources[0].is_dir() && dest.exists() {
             return Err(XcpError::InvalidDestination("Cannot copy a directory to a file.").into());
         } else if sources.len() > 1 {
