@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### <!-- 0 -->Added
+
+- *(xcp)* New `--sync` option to mirror a source directory onto a destination: copies new or changed files (compared by mtime + size + permissions), recreates symlinks whose target changed, and deletes destination entries absent from the source. Equivalent to `rsync` without block-level deltas. Incompatible with `--no-clobber`; requires exactly one source directory.
+
 ## [0.24.8](https://github.com/tarka/xcp/compare/xcp-v0.24.7...xcp-v0.24.8) - 2026-05-03
 
 ### <!-- 1 -->Bug Fixes
