@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### <!-- 1 -->Bug Fixes
 
 - *(xcp)* `--sync` now correctly overwrites read-only destination files (e.g. `0444`); the owner write bit is temporarily added before the copy and the correct permissions are restored from the source afterwards.
+- *(xcp)* `--sync` now correctly handles type conflicts: if a path is a directory in the source but a file/symlink in the destination (or vice versa), the destination entry is replaced with the correct type.
 
 ### <!-- 0 -->Added
 
