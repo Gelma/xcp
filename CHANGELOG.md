@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### <!-- 1 -->Bug Fixes
+
+- *(xcp)* `--sync` now correctly overwrites read-only destination files (e.g. `0444`); the owner write bit is temporarily added before the copy and the correct permissions are restored from the source afterwards.
+
 ### <!-- 0 -->Added
 
 - *(xcp)* New `--sync` option to mirror a source directory onto a destination: copies new or changed files (compared by mtime + size + permissions), recreates symlinks whose target changed, and deletes destination entries absent from the source. Equivalent to `rsync` without block-level deltas. Incompatible with `--no-clobber`; requires exactly one source directory.
