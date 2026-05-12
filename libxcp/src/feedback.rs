@@ -40,7 +40,9 @@ pub enum StatusUpdate {
     /// An update representing that this number of bytes will need to be copied.
     Size(u64),
     /// An error during a copy operation.
-    Error(XcpError)
+    Error(XcpError),
+    /// An informational message (e.g. from dry-run mode).
+    Notice(String),
 }
 
 pub trait StatusUpdater: Sync + Send {

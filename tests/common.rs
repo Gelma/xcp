@@ -2152,3 +2152,57 @@ fn sync_full_enables_hardlinks() {
     let m2 = dst.join("file2.txt").symlink_metadata().unwrap();
     assert_eq!(m1.ino(), m2.ino(), "--sync-full must preserve hard links");
 }
+
+#[test]
+fn sync_dry_run_does_not_modify_dest() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(src.join("sub")).unwrap();
+    create_file(&src.join("a.txt"), "new").unwrap();
+    create_file(&src.join("sub/b.txt"), "new").unwrap();
+    create_dir_all(&dst).unwrap();
+    create_file(&dst.join("stale.txt"), "stale").unwrap();
+
+    let out = run(&["--sync", "--dry-run", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    // Dry-run must not create new files.
+    assert!(!dst.join("a.txt").exists());
+    assert!(!dst.join("sub").exists());
+    // Dry-run must not delete stale files.
+    assert!(dst.join("stale.txt").exists());
+}
+
+#[test]
+fn sync_dry_run_reports_actions() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("a.txt"), "hello").unwrap();
+    create_dir_all(&dst).unwrap();
+    create_file(&dst.join("stale.txt"), "stale").unwrap();
+
+    let out = run(&["--sync", "--dry-run", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("would copy"), "expected 'would copy' in: {stdout}");
+    assert!(stdout.contains("would delete"), "expected 'would delete' in: {stdout}");
+}
+
+#[test]
+fn sync_dry_run_requires_sync() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("a.txt"), "hello").unwrap();
+
+    let out = run(&["--dry-run", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("--dry-run requires --sync"));
+}

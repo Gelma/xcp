@@ -343,37 +343,45 @@ pub fn sync_walker(
             FileType::Dir => {
                 match target.symlink_metadata() {
                     Ok(m) if !m.file_type().is_dir() => {
-                        // Target exists but is a file or symlink: remove it
-                        // so we can create a directory in its place.
-                        debug!("Sync: removing non-directory blocking {target:?}");
-                        fs::remove_file(&target)?;
-                        create_dir_all(&target)?;
+                        if config.dry_run {
+                            stats.send(StatusUpdate::Notice(format!("would replace with dir: {}", target.display())))?;
+                        } else {
+                            debug!("Sync: removing non-directory blocking {target:?}");
+                            fs::remove_file(&target)?;
+                            create_dir_all(&target)?;
+                        }
                     }
                     Err(_) => {
-                        debug!("Sync: creating directory {target:?}");
-                        if let Err(err) = create_dir_all(&target) {
-                            let msg = format!("Error creating target directory: {err}");
-                            error!("{msg}");
-                            return Err(XcpError::CopyError(msg).into());
+                        if config.dry_run {
+                            stats.send(StatusUpdate::Notice(format!("would create dir: {}", target.display())))?;
+                        } else {
+                            debug!("Sync: creating directory {target:?}");
+                            if let Err(err) = create_dir_all(&target) {
+                                let msg = format!("Error creating target directory: {err}");
+                                error!("{msg}");
+                                return Err(XcpError::CopyError(msg).into());
+                            }
                         }
                     }
                     Ok(_) => {} // already a directory
                 }
-                if config.ownership {
-                    if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
-                        warn!("Failed to copy directory ownership: {target:?}: {e}");
-                    }
-                }
-                if !config.no_perms {
-                    if let Ok(dst_meta) = target.symlink_metadata() {
-                        if dst_meta.permissions() != meta.permissions() {
-                            fs::set_permissions(&target, meta.permissions())?;
+                if !config.dry_run {
+                    if config.ownership {
+                        if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
+                            warn!("Failed to copy directory ownership: {target:?}: {e}");
                         }
                     }
-                }
-                if config.copy_xattrs {
-                    if let Err(e) = sync_xattrs(&from, &target) {
-                        warn!("Failed to sync xattrs for directory {from:?}: {e}");
+                    if !config.no_perms {
+                        if let Ok(dst_meta) = target.symlink_metadata() {
+                            if dst_meta.permissions() != meta.permissions() {
+                                fs::set_permissions(&target, meta.permissions())?;
+                            }
+                        }
+                    }
+                    if config.copy_xattrs {
+                        if let Err(e) = sync_xattrs(&from, &target) {
+                            warn!("Failed to sync xattrs for directory {from:?}: {e}");
+                        }
                     }
                 }
             }
@@ -396,15 +404,19 @@ pub fn sync_walker(
                             },
                         };
                         if needs_relink {
-                            if let Ok(m) = target.symlink_metadata() {
-                                if m.file_type().is_dir() {
-                                    fs::remove_dir_all(&target)?;
-                                } else {
-                                    fs::remove_file(&target)?;
+                            if config.dry_run {
+                                stats.send(StatusUpdate::Notice(format!("would hard link: {} -> {}", target.display(), first_dest.display())))?;
+                            } else {
+                                if let Ok(m) = target.symlink_metadata() {
+                                    if m.file_type().is_dir() {
+                                        fs::remove_dir_all(&target)?;
+                                    } else {
+                                        fs::remove_file(&target)?;
+                                    }
                                 }
+                                debug!("Sync: hard-link {first_dest:?} -> {target:?}");
+                                fs::hard_link(&first_dest, &target)?;
                             }
-                            debug!("Sync: hard-link {first_dest:?} -> {target:?}");
-                            fs::hard_link(&first_dest, &target)?;
                         } else {
                             debug!("Sync: skip unchanged hard-link {from:?}");
                         }
@@ -427,19 +439,23 @@ pub fn sync_walker(
                             }
                         };
                         if should_copy {
-                            if let Ok(dst_meta) = target.symlink_metadata() {
-                                if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
-                                    let mut perms = dst_meta.permissions();
-                                    perms.set_mode(dst_meta.mode() | 0o200);
-                                    fs::set_permissions(&target, perms)?;
+                            if config.dry_run {
+                                stats.send(StatusUpdate::Notice(format!("would copy: {} -> {}", from.display(), target.display())))?;
+                            } else {
+                                if let Ok(dst_meta) = target.symlink_metadata() {
+                                    if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
+                                        let mut perms = dst_meta.permissions();
+                                        perms.set_mode(dst_meta.mode() | 0o200);
+                                        fs::set_permissions(&target, perms)?;
+                                    }
                                 }
+                                debug!("Sync: copy (hard-link first) {from:?} -> {target:?}");
+                                stats.send(StatusUpdate::Size(meta.len()))?;
+                                let hdl = CopyHandle::new(&from, &target, config)?;
+                                hdl.copy_file(&stats)?;
                             }
-                            debug!("Sync: copy (hard-link first) {from:?} -> {target:?}");
-                            stats.send(StatusUpdate::Size(meta.len()))?;
-                            let hdl = CopyHandle::new(&from, &target, config)?;
-                            hdl.copy_file(&stats)?;
                         } else {
-                            if config.copy_xattrs {
+                            if !config.dry_run && config.copy_xattrs {
                                 if let Err(e) = sync_xattrs(&from, &target) {
                                     warn!("Failed to sync xattrs {from:?}: {e}");
                                 }
@@ -464,22 +480,26 @@ pub fn sync_walker(
                         }
                     };
                     if should_copy {
-                        // If the existing destination file is not writable,
-                        // add the owner write bit so File::create() can
-                        // overwrite it. copy_permissions() will restore the
-                        // correct permissions once the copy is complete.
-                        if let Ok(dst_meta) = target.symlink_metadata() {
-                            if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
-                                let mut perms = dst_meta.permissions();
-                                perms.set_mode(dst_meta.mode() | 0o200);
-                                fs::set_permissions(&target, perms)?;
+                        if config.dry_run {
+                            stats.send(StatusUpdate::Notice(format!("would copy: {} -> {}", from.display(), target.display())))?;
+                        } else {
+                            // If the existing destination file is not writable,
+                            // add the owner write bit so File::create() can
+                            // overwrite it. copy_permissions() will restore the
+                            // correct permissions once the copy is complete.
+                            if let Ok(dst_meta) = target.symlink_metadata() {
+                                if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
+                                    let mut perms = dst_meta.permissions();
+                                    perms.set_mode(dst_meta.mode() | 0o200);
+                                    fs::set_permissions(&target, perms)?;
+                                }
                             }
+                            debug!("Sync: copy {from:?} -> {target:?}");
+                            stats.send(StatusUpdate::Size(meta.len()))?;
+                            work_tx.send(Operation::Copy(from, target))?;
                         }
-                        debug!("Sync: copy {from:?} -> {target:?}");
-                        stats.send(StatusUpdate::Size(meta.len()))?;
-                        work_tx.send(Operation::Copy(from, target))?;
                     } else {
-                        if config.copy_xattrs {
+                        if !config.dry_run && config.copy_xattrs {
                             if let Err(e) = sync_xattrs(&from, &target) {
                                 warn!("Failed to sync xattrs {from:?}: {e}");
                             }
@@ -502,15 +522,19 @@ pub fn sync_walker(
                     }
                 };
                 if should_link {
-                    if target.symlink_metadata().is_ok() {
-                        if target.symlink_metadata().map(|m| m.file_type().is_dir()).unwrap_or(false) {
-                            fs::remove_dir_all(&target)?;
-                        } else {
-                            fs::remove_file(&target)?;
+                    if config.dry_run {
+                        stats.send(StatusUpdate::Notice(format!("would create symlink: {} -> {}", target.display(), link_target.display())))?;
+                    } else {
+                        if target.symlink_metadata().is_ok() {
+                            if target.symlink_metadata().map(|m| m.file_type().is_dir()).unwrap_or(false) {
+                                fs::remove_dir_all(&target)?;
+                            } else {
+                                fs::remove_file(&target)?;
+                            }
                         }
+                        debug!("Sync: symlink {link_target:?} -> {target:?}");
+                        work_tx.send(Operation::Link(link_target, target))?;
                     }
-                    debug!("Sync: symlink {link_target:?} -> {target:?}");
-                    work_tx.send(Operation::Link(link_target, target))?;
                 } else {
                     debug!("Sync: skip unchanged symlink {from:?}");
                 }
@@ -518,8 +542,12 @@ pub fn sync_walker(
 
             FileType::Socket | FileType::Char | FileType::Fifo => {
                 if config.copy_special {
-                    debug!("Sync: special file {from:?} -> {target:?}");
-                    work_tx.send(Operation::Special(from, target))?;
+                    if config.dry_run {
+                        stats.send(StatusUpdate::Notice(format!("would copy special: {} -> {}", from.display(), target.display())))?;
+                    } else {
+                        debug!("Sync: special file {from:?} -> {target:?}");
+                        work_tx.send(Operation::Special(from, target))?;
+                    }
                 } else {
                     debug!("Sync: skip special file {from:?}");
                 }
@@ -527,8 +555,12 @@ pub fn sync_walker(
 
             FileType::Block => {
                 if config.copy_special {
-                    debug!("Sync: block device {from:?} -> {target:?}");
-                    work_tx.send(Operation::Special(from, target))?;
+                    if config.dry_run {
+                        stats.send(StatusUpdate::Notice(format!("would copy special: {} -> {}", from.display(), target.display())))?;
+                    } else {
+                        debug!("Sync: block device {from:?} -> {target:?}");
+                        work_tx.send(Operation::Special(from, target))?;
+                    }
                 } else {
                     debug!("Sync: skip block device {from:?}");
                 }
@@ -573,7 +605,13 @@ pub fn sync_walker(
                 .cloned()
                 .collect();
 
-            parallel_delete(roots, config.num_workers())?;
+            if config.dry_run {
+                for path in &roots {
+                    stats.send(StatusUpdate::Notice(format!("would delete: {}", path.display())))?;
+                }
+            } else {
+                parallel_delete(roots, config.num_workers())?;
+            }
         }
     }
 

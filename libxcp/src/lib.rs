@@ -63,6 +63,7 @@
 //!             StatusUpdate::Error(e) => {
 //!                 panic!("Error during copy: {}", e);
 //!             }
+//!             StatusUpdate::Notice(msg) => println!("{}", msg),
 //!         }
 //!     }
 //!
@@ -130,6 +131,7 @@ mod tests {
                     println!("Error during copy: {e}");
                     return Err(e.into());
                 }
+                StatusUpdate::Notice(msg) => println!("{msg}"),
             }
         }
 

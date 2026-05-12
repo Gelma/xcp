@@ -101,7 +101,9 @@ impl CopyDriver for Driver {
         // Workers creating files inside directories update directory mtime, so
         // this must run last to produce correct final timestamps.
         if let Some(source) = sync_source {
-            sync_dir_timestamps(&source, dest, &self.config)?;
+            if !self.config.dry_run {
+                sync_dir_timestamps(&source, dest, &self.config)?;
+            }
         }
 
         Ok(())

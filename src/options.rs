@@ -198,6 +198,14 @@ pub struct Opts {
     #[arg(long)]
     pub sync_full: bool,
 
+    /// Dry-run: show what --sync would do without touching any files.
+    ///
+    /// Prints each planned action (copy, delete, create directory, etc.) to
+    /// stdout and exits without modifying the destination. Requires --sync or
+    /// --sync-full.
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Path list.
     ///
     /// Source and destination files, or multiple source(s) to a directory.
@@ -247,6 +255,7 @@ impl From<&Opts> for Config {
             preserve_hardlinks: opts.hardlinks || sync_full,
             copy_special: opts.special || sync_full,
             copy_xattrs: opts.xattrs || sync_full,
+            dry_run: opts.dry_run,
         }
     }
 }

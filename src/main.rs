@@ -98,6 +98,9 @@ fn opts_check(opts: &Opts) -> Result<()> {
     if opts.xattrs && !effective_sync {
         return Err(XcpError::InvalidArguments("--xattrs requires --sync or --sync-full".to_string()).into());
     }
+    if opts.dry_run && !effective_sync {
+        return Err(XcpError::InvalidArguments("--dry-run requires --sync or --sync-full".to_string()).into());
+    }
     Ok(())
 }
 
@@ -201,6 +204,7 @@ fn main() -> Result<()> {
                 error!("Received error: {e}");
                 return Err(e.into());
             }
+            StatusUpdate::Notice(msg) => println!("{msg}"),
         }
     }
 

@@ -173,6 +173,13 @@ pub struct Config {
     /// unchanged (same mtime, size, and permissions). ACLs on Linux are
     /// stored as xattrs and are therefore included automatically.
     pub copy_xattrs: bool,
+
+    /// Dry-run mode: report what would be done without modifying anything.
+    ///
+    /// Only meaningful with `sync = true`. Each planned action is emitted as a
+    /// `StatusUpdate::Notice` message; no files are created, modified, or
+    /// deleted.
+    pub dry_run: bool,
 }
 
 impl Config {
@@ -204,6 +211,7 @@ impl Default for Config {
             preserve_hardlinks: false,
             copy_special: false,
             copy_xattrs: false,
+            dry_run: false,
         }
     }
 }
