@@ -64,11 +64,12 @@ Drivers send `StatusUpdate` messages through the `StatusUpdater` trait; `Channel
 `xcp --sync src/ dst/` makes `dst/` identical to `src/` without rsync-style block deltas:
 
 - **skip** files where mtime (nanosecond precision) + size + permissions all match
-- **copy** files that are new or changed
+- **copy** files that are new or changed; if the destination file is read-only the owner write bit is temporarily added so `File::create` can overwrite it, then `copy_permissions` restores the correct mode
 - **recreate** symlinks whose target changed
-- **delete** destination entries absent from the source (directories walked `contents_first`)
+- **replace** entries whose type conflicts (source dir / dest file or vice versa)
+- **delete** destination entries absent from the source: subtree roots are identified (paths whose parent is not also being deleted) and removed in parallel across `num_cpus` worker threads via `parallel_delete()`, each using `remove_dir_all`
 
-Implemented in `libxcp/src/operations.rs` as `sync_walker()`, called by the `parfile` driver when `Config::sync` is true. Incompatible with `--no-clobber`; requires exactly one source directory.
+Implemented in `libxcp/src/operations.rs` as `sync_walker()` and `parallel_delete()`, called by the `parfile` driver when `Config::sync` is true. Incompatible with `--no-clobber`; requires exactly one source directory.
 
 ## Feature Flags
 
