@@ -329,13 +329,23 @@ pub fn sync_walker(
         let ft = FileType::from(meta.file_type());
         match ft {
             FileType::Dir => {
-                if !target.exists() {
-                    debug!("Sync: creating directory {target:?}");
-                    if let Err(err) = create_dir_all(&target) {
-                        let msg = format!("Error creating target directory: {err}");
-                        error!("{msg}");
-                        return Err(XcpError::CopyError(msg).into());
+                match target.symlink_metadata() {
+                    Ok(m) if !m.file_type().is_dir() => {
+                        // Target exists but is a file or symlink: remove it
+                        // so we can create a directory in its place.
+                        debug!("Sync: removing non-directory blocking {target:?}");
+                        fs::remove_file(&target)?;
+                        create_dir_all(&target)?;
                     }
+                    Err(_) => {
+                        debug!("Sync: creating directory {target:?}");
+                        if let Err(err) = create_dir_all(&target) {
+                            let msg = format!("Error creating target directory: {err}");
+                            error!("{msg}");
+                            return Err(XcpError::CopyError(msg).into());
+                        }
+                    }
+                    Ok(_) => {} // already a directory
                 }
                 if config.ownership {
                     if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {

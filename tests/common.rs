@@ -1769,6 +1769,42 @@ fn sync_skips_unchanged_file() {
 }
 
 #[test]
+fn sync_dir_replaces_file_in_dest() {
+    // Source has a directory where dest has a plain file with the same name.
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(src.join("foo")).unwrap();
+    create_file(&src.join("foo/bar.txt"), "content").unwrap();
+    create_dir_all(&dst).unwrap();
+    create_file(&dst.join("foo"), "i am a file").unwrap(); // file where a dir is expected
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(dst.join("foo").is_dir());
+    assert!(file_contains(&dst.join("foo/bar.txt"), "content").unwrap());
+}
+
+#[test]
+fn sync_file_replaces_dir_in_dest() {
+    // Source has a plain file where dest has a directory with the same name.
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("foo"), "i am a file").unwrap();
+    create_dir_all(dst.join("foo")).unwrap();
+    create_file(&dst.join("foo/bar.txt"), "stale").unwrap(); // dir where a file is expected
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    assert!(dst.join("foo").is_file());
+    assert!(file_contains(&dst.join("foo"), "i am a file").unwrap());
+}
+
+#[test]
 #[cfg_attr(feature = "test_no_perms", ignore = "No FS support")]
 fn sync_overwrites_readonly_file() {
     // A read-only file in dest that differs from source must be
