@@ -617,3 +617,79 @@ fn parallel_delete(roots: Vec<PathBuf>, nworkers: usize) -> Result<()> {
 
     Ok(())
 }
+
+/// Apply timestamps (and permissions, if enabled) to all destination directories
+/// after all copy workers have finished. This must run as a post-pass because
+/// workers creating files inside directories update the directory mtime.
+/// Walks in `contents_first` order so innermost directories are stamped before
+/// their parents, preventing subsequent parent accesses from disturbing the
+/// already-set mtime.
+pub fn sync_dir_timestamps(source: &Path, dest: &Path, config: &Config) -> Result<()> {
+    if config.no_timestamps && config.no_perms {
+        return Ok(());
+    }
+
+    for entry in WalkDir::new(source)
+        .follow_root_links(false)
+        .contents_first(true)
+        .into_iter()
+    {
+        let epath = match entry {
+            Ok(e) => e.into_path(),
+            Err(e) => {
+                warn!("Error walking source for dir timestamp sync: {e}");
+                continue;
+            }
+        };
+
+        let meta = match epath.symlink_metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+
+        let rel = match epath.strip_prefix(source) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let target = if empty_path(rel) {
+            dest.to_path_buf()
+        } else {
+            dest.join(rel)
+        };
+
+        if !target.is_dir() {
+            continue;
+        }
+
+        let src_fd = match File::open(&epath) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Cannot open source dir for timestamp sync {epath:?}: {e}");
+                continue;
+            }
+        };
+        let dst_fd = match File::open(&target) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Cannot open dest dir for timestamp sync {target:?}: {e}");
+                continue;
+            }
+        };
+
+        if !config.no_perms {
+            if let Err(e) = copy_permissions(&src_fd, &dst_fd) {
+                warn!("Failed to sync permissions for directory {target:?}: {e}");
+            }
+        }
+        if !config.no_timestamps {
+            if let Err(e) = copy_timestamps(&src_fd, &dst_fd) {
+                warn!("Failed to sync timestamps for directory {target:?}: {e}");
+            }
+        }
+    }
+
+    Ok(())
+}

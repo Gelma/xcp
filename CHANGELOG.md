@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(xcp)* New `--special` flag: enables copying of special files (character devices, block devices, sockets, FIFOs) during `--sync`. Without this flag, special files are skipped. Also enables block-device copying in normal (non-sync) mode.
 - *(xcp)* New `--xattrs` flag for `--sync`: synchronises extended attributes (including POSIX ACLs, stored as xattrs on Linux) even for files that are otherwise unchanged (same mtime, size, permissions). Requires `--sync`.
 - *(xcp)* New `--sync-full` flag: activates all sync-related options at once (`--sync --hardlinks --special --xattrs --ownership`); implies `--sync` so it need not be specified separately.
+- *(xcp)* `--sync` now synchronises mtime/atime and permissions of directories, not only of files. Directory timestamps are applied in a dedicated post-pass (deepest-first) after all copy workers have finished, so workers creating files inside directories cannot overwrite the applied timestamps.
 
 ## [0.24.8](https://github.com/tarka/xcp/compare/xcp-v0.24.7...xcp-v0.24.8) - 2026-05-03
 

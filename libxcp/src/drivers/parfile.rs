@@ -30,7 +30,7 @@ use crate::config::Config;
 use crate::drivers::CopyDriver;
 use crate::errors::{Result, XcpError};
 use crate::feedback::{StatusUpdate, StatusUpdater};
-use crate::operations::{CopyHandle, Operation, sync_walker, tree_walker};
+use crate::operations::{CopyHandle, Operation, sync_dir_timestamps, sync_walker, tree_walker};
 
 // ********************************************************************** //
 
@@ -49,6 +49,14 @@ impl Driver {
 impl CopyDriver for Driver {
     fn copy(&self, sources: Vec<PathBuf>, dest: &Path, stats: Arc<dyn StatusUpdater>) -> Result<()> {
         let (work_tx, work_rx) = cbc::unbounded();
+
+        // Save the sync source before it is moved into the walker thread so we
+        // can apply directory timestamps after all workers have finished.
+        let sync_source: Option<PathBuf> = if self.config.sync {
+            sources.first().cloned()
+        } else {
+            None
+        };
 
         // Thread which walks the file tree and sends jobs to the
         // workers. The worker tx channel is moved to the walker so it is
@@ -87,6 +95,13 @@ impl CopyDriver for Driver {
         for handle in joins {
             handle.join()
                 .map_err(|_| XcpError::CopyError("Error during copy operation".to_string()))??;
+        }
+
+        // Apply directory timestamps after all workers have finished.
+        // Workers creating files inside directories update directory mtime, so
+        // this must run last to produce correct final timestamps.
+        if let Some(source) = sync_source {
+            sync_dir_timestamps(&source, dest, &self.config)?;
         }
 
         Ok(())

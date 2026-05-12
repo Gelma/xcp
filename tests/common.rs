@@ -1884,6 +1884,55 @@ fn sync_updates_changed_symlink() {
     );
 }
 
+// ===== directory metadata sync tests =====
+
+#[test]
+fn sync_copies_dir_timestamps() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(src.join("sub")).unwrap();
+    create_file(&src.join("sub/f.txt"), "data").unwrap();
+
+    // Set a well-known mtime in the past on the source subdirectory.
+    set_time_past(&src.join("sub")).unwrap();
+    let expected_mtime = src.join("sub").metadata().unwrap().modified().unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(out.status.success());
+    let got_mtime = dst.join("sub").metadata().unwrap().modified().unwrap();
+    assert!(
+        timestamps_same(&expected_mtime, &got_mtime),
+        "dest directory mtime must match source"
+    );
+}
+
+#[test]
+fn sync_no_timestamps_leaves_dir_mtime_unchanged() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(src.join("sub")).unwrap();
+    create_file(&src.join("sub/f.txt"), "data").unwrap();
+
+    set_time_past(&src.join("sub")).unwrap();
+
+    let out = run(&[
+        "--sync", "--no-timestamps",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(out.status.success());
+    let src_mtime = src.join("sub").metadata().unwrap().modified().unwrap();
+    let dst_mtime = dst.join("sub").metadata().unwrap().modified().unwrap();
+    assert!(
+        !timestamps_same(&src_mtime, &dst_mtime),
+        "dest directory mtime must not be copied when --no-timestamps is set"
+    );
+}
+
 // ===== --hardlinks tests =====
 
 #[test]
