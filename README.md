@@ -1,3 +1,13 @@
+# xcp with a little bit of mirrordir and rsync
+
+Hi, this is unofficial repo of `xcp` with CLAUDE generated patches.
+Why? I dreamed about a mirrordir/rsync version with blazing fast feature of `xcp`,
+and CLAUDE did the job!
+
+It's working, and that's enough for me.
+
+Don't trust me, my code, or CLAUDE.
+
 # xcp: An extended cp
 
 `xcp` is a (partial) clone of the Unix `cp` command. It is not intended as a
