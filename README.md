@@ -9,6 +9,14 @@ It's working, and that's enough for me.
 
 Don't trust me, my code, or CLAUDE.
 
+```
+cargo build
+
+./target/debug/xcp --sync dir_source dir_dest
+```
+
+You could appreciate also: `--sync-full` and `--hardlinks`
+
 # xcp: An extended cp
 
 `xcp` is a (partial) clone of the Unix `cp` command. It is not intended as a
