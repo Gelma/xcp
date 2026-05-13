@@ -9,13 +9,15 @@ It's working, and that's enough for me.
 
 Don't trust me, my code, or CLAUDE.
 
+Be careful: it deletes also file/dir, in the same way as `rsync -avPHhAXx --del`
+
 ```
 cargo build
 
-./target/debug/xcp --sync dir_source dir_dest
+./target/debug/xcp --sync /source_dir/ /destination_dir/
 ```
 
-You could appreciate also: `--sync-full` and `--hardlinks`
+You could appreciate also: `--sync-full`, `--hardlinks`, `--dry-run`
 
 # xcp: An extended cp
 
