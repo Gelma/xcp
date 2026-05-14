@@ -2206,3 +2206,232 @@ fn sync_dry_run_requires_sync() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("--dry-run requires --sync"));
 }
+
+// ===== --checksum tests =====
+
+#[test]
+fn checksum_requires_sync() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "data").unwrap();
+
+    let out = run(&["--checksum", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("--checksum requires --sync"));
+}
+
+/// When mtime+size match but content differs, --checksum must trigger a re-copy.
+#[test]
+fn sync_checksum_detects_tampered_file() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "v1").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let src_file = src.join("f.txt");
+    let dst_file = dst.join("f.txt");
+    let saved_mtime = src_file.metadata().unwrap().modified().unwrap();
+
+    // Replace dst content with same-size data, then restore mtime to match src.
+    write(&dst_file, "v2").unwrap();
+    let ft = FileTimes::new().set_modified(saved_mtime);
+    File::open(&dst_file).unwrap().set_times(ft).unwrap();
+
+    // Without --checksum the tampered dst is not detected.
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+    assert!(file_contains(&dst_file, "v2").unwrap(), "file must not have been re-copied without --checksum");
+
+    // With --checksum the content difference is detected and dst is corrected.
+    let out = run(&["--sync", "--checksum", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+    assert!(file_contains(&dst_file, "v1").unwrap(), "file must have been re-copied with --checksum");
+}
+
+/// When content is actually identical, --checksum must not trigger a re-copy.
+#[test]
+fn sync_checksum_skips_identical_file() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "hello").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let dst_file = dst.join("f.txt");
+    // If the file is re-copied, File::create() produces a new inode.
+    let inode_before = dst_file.metadata().unwrap().ino();
+
+    let out = run(&["--sync", "--checksum", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let inode_after = dst_file.metadata().unwrap().ino();
+    assert_eq!(inode_before, inode_after, "inode must not change: file should have been skipped");
+    assert!(file_contains(&dst_file, "hello").unwrap());
+}
+
+/// --dry-run + --checksum must report "would copy (checksum differs)" without touching files.
+#[test]
+fn sync_checksum_dry_run_reports_differences() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "v1").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let src_file = src.join("f.txt");
+    let dst_file = dst.join("f.txt");
+    let saved_mtime = src_file.metadata().unwrap().modified().unwrap();
+
+    write(&dst_file, "v2").unwrap();
+    let ft = FileTimes::new().set_modified(saved_mtime);
+    File::open(&dst_file).unwrap().set_times(ft).unwrap();
+
+    let out = run(&[
+        "--sync", "--checksum", "--dry-run",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("would copy (checksum differs)"),
+        "expected 'would copy (checksum differs)' in: {stdout}"
+    );
+    // Dry-run must not have modified the destination.
+    assert!(file_contains(&dst_file, "v2").unwrap(), "dry-run must not modify destination");
+}
+
+/// --dry-run + --checksum must NOT report a difference when content is identical.
+#[test]
+fn sync_checksum_dry_run_silent_when_identical() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "same").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let out = run(&[
+        "--sync", "--checksum", "--dry-run",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("would copy"),
+        "must not report a copy for an identical file; got: {stdout}"
+    );
+}
+
+/// --checksum-workers N must be accepted and produce correct results.
+#[test]
+fn sync_checksum_workers_option() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "v1").unwrap();
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let src_file = src.join("f.txt");
+    let dst_file = dst.join("f.txt");
+    let saved_mtime = src_file.metadata().unwrap().modified().unwrap();
+
+    write(&dst_file, "v2").unwrap();
+    let ft = FileTimes::new().set_modified(saved_mtime);
+    File::open(&dst_file).unwrap().set_times(ft).unwrap();
+
+    let out = run(&[
+        "--sync", "--checksum", "--checksum-workers", "2",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(out.status.success());
+    assert!(file_contains(&dst_file, "v1").unwrap(), "file must have been re-copied");
+}
+
+/// With multiple files, only those with differing content must be re-copied.
+#[test]
+fn sync_checksum_partial_mismatch() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("same.txt"), "hello").unwrap();
+    create_file(&src.join("diff.txt"), "v1x").unwrap(); // 3 bytes
+
+    let out = run(&["--sync", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    // Tamper diff.txt in dst with same-size content, keep mtime to fool metadata check.
+    let saved_mtime = src.join("diff.txt").metadata().unwrap().modified().unwrap();
+    write(&dst.join("diff.txt"), "v2x").unwrap();
+    let ft = FileTimes::new().set_modified(saved_mtime);
+    File::open(&dst.join("diff.txt")).unwrap().set_times(ft).unwrap();
+
+    // same.txt is genuinely unchanged; record its inode.
+    let inode_same_before = dst.join("same.txt").metadata().unwrap().ino();
+
+    let out = run(&["--sync", "--checksum", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    // same.txt must not have been re-copied.
+    let inode_same_after = dst.join("same.txt").metadata().unwrap().ino();
+    assert_eq!(inode_same_before, inode_same_after, "same.txt must not have been re-copied");
+
+    // diff.txt must have been corrected.
+    assert!(file_contains(&dst.join("diff.txt"), "v1x").unwrap(), "diff.txt must be corrected");
+}
+
+/// --checksum + --hardlinks: a hard-linked file whose content was tampered must be re-copied.
+#[test]
+fn sync_checksum_detects_tampered_hardlinked_file() {
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("file1.txt"), "v1").unwrap();
+    fs::hard_link(src.join("file1.txt"), src.join("file2.txt")).unwrap();
+
+    let out = run(&["--sync", "--hardlinks", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let dst_file1 = dst.join("file1.txt");
+    let saved_mtime = dst_file1.metadata().unwrap().modified().unwrap();
+
+    // Corrupt file1.txt in dst with same-size content.
+    write(&dst_file1, "v2").unwrap();
+    let ft = FileTimes::new().set_modified(saved_mtime);
+    File::open(&dst_file1).unwrap().set_times(ft).unwrap();
+
+    let out = run(&[
+        "--sync", "--checksum", "--hardlinks",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]).unwrap();
+
+    assert!(out.status.success());
+    assert!(file_contains(&dst_file1, "v1").unwrap(), "hard-linked file must have been re-copied");
+}
