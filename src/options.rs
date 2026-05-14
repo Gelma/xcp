@@ -206,6 +206,21 @@ pub struct Opts {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Verify file content with BLAKE3 checksum in sync mode.
+    ///
+    /// When set, files that appear unchanged by metadata comparison (mtime,
+    /// size, permissions) are also verified by computing their BLAKE3 hash.
+    /// If the hashes differ the file is copied. Requires --sync or --sync-full.
+    #[arg(long)]
+    pub checksum: bool,
+
+    /// Number of parallel workers for checksum computation.
+    ///
+    /// How many files to hash in parallel when --checksum is set. Defaults
+    /// to the number of logical CPU threads when 0.
+    #[arg(long, default_value = "0")]
+    pub checksum_workers: usize,
+
     /// Path list.
     ///
     /// Source and destination files, or multiple source(s) to a directory.
@@ -256,6 +271,8 @@ impl From<&Opts> for Config {
             copy_special: opts.special || sync_full,
             copy_xattrs: opts.xattrs || sync_full,
             dry_run: opts.dry_run,
+            checksum: opts.checksum,
+            checksum_workers: opts.checksum_workers,
         }
     }
 }

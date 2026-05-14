@@ -15,6 +15,7 @@
  */
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 use std::{cmp, thread};
 use std::fs::{self, canonicalize, create_dir_all, read_link, File, Metadata};
@@ -277,6 +278,82 @@ fn empty_path(path: &Path) -> bool {
     *path == PathBuf::new()
 }
 
+fn compute_blake3(path: &Path) -> Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20]; // 1 MiB
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Compare a batch of (src, dst, size) file pairs by BLAKE3 hash in parallel,
+/// sending `Operation::Copy` for pairs whose content differs.
+fn parallel_checksum(
+    candidates: Vec<(PathBuf, PathBuf, u64)>,
+    nworkers: usize,
+    dry_run: bool,
+    copy_xattrs: bool,
+    work_tx: &cbc::Sender<Operation>,
+    stats: &Arc<dyn StatusUpdater>,
+) -> Result<()> {
+    let (tx, rx) = cbc::unbounded::<(PathBuf, PathBuf, u64)>();
+
+    let handles: Vec<_> = (0..nworkers)
+        .map(|_| {
+            let wrx = rx.clone();
+            let wtx = work_tx.clone();
+            let wstats = stats.clone();
+            thread::spawn(move || -> Result<()> {
+                for (src, dst, size) in wrx {
+                    let src_hash = compute_blake3(&src)?;
+                    let dst_hash = compute_blake3(&dst)?;
+                    if src_hash != dst_hash {
+                        debug!("Sync: checksum differs, queuing copy {:?}", src);
+                        if dry_run {
+                            wstats.send(StatusUpdate::Notice(format!(
+                                "would copy (checksum differs): {} -> {}",
+                                src.display(),
+                                dst.display()
+                            )))?;
+                        } else {
+                            wstats.send(StatusUpdate::Size(size))?;
+                            wtx.send(Operation::Copy(src, dst))?;
+                        }
+                    } else {
+                        debug!("Sync: skip unchanged (checksum match) {:?}", src);
+                        if !dry_run && copy_xattrs {
+                            if let Err(e) = sync_xattrs(&src, &dst) {
+                                warn!("Failed to sync xattrs {:?}: {e}", src);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+        })
+        .collect();
+
+    for item in candidates {
+        tx.send(item)
+            .map_err(|_| XcpError::CopyError("Checksum worker disconnected".to_string()))?;
+    }
+    drop(tx);
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| XcpError::CopyError("Error in parallel checksum".to_string()))??;
+    }
+
+    Ok(())
+}
+
 /// Return true when a source file must be copied over an existing destination
 /// file. Compares mtime (nanosecond precision), size, and optionally permissions.
 fn needs_copy(src: &Metadata, dst: &Metadata, config: &Config) -> bool {
@@ -312,6 +389,8 @@ pub fn sync_walker(
     let mut source_relpaths: HashSet<PathBuf> = HashSet::new();
     // Maps (dev, ino) of hard-linked source files to the first dest path written.
     let mut hardlink_map: HashMap<(u64, u64), PathBuf> = HashMap::new();
+    // Files whose metadata matches but content must be verified with BLAKE3.
+    let mut checksum_candidates: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
     let gitignore = parse_ignore(source, config)?;
 
     for entry in WalkDir::new(source)
@@ -438,6 +517,13 @@ pub fn sync_walker(
                                 }
                             }
                         };
+                        // When checksum is enabled and metadata matches, verify content inline.
+                        let should_copy = should_copy || (config.checksum && {
+                            match compute_blake3(&from).and_then(|sh| compute_blake3(&target).map(|dh| sh != dh)) {
+                                Ok(differs) => differs,
+                                Err(e) => { warn!("Checksum error for {from:?}: {e}"); false }
+                            }
+                        });
                         if should_copy {
                             if config.dry_run {
                                 stats.send(StatusUpdate::Notice(format!("would copy: {} -> {}", from.display(), target.display())))?;
@@ -498,6 +584,10 @@ pub fn sync_walker(
                             stats.send(StatusUpdate::Size(meta.len()))?;
                             work_tx.send(Operation::Copy(from, target))?;
                         }
+                    } else if config.checksum {
+                        // Defer content comparison to the parallel checksum phase.
+                        debug!("Sync: defer checksum check {from:?}");
+                        checksum_candidates.push((from, target, meta.len()));
                     } else {
                         if !config.dry_run && config.copy_xattrs {
                             if let Err(e) = sync_xattrs(&from, &target) {
@@ -613,6 +703,18 @@ pub fn sync_walker(
                 parallel_delete(roots, config.num_workers())?;
             }
         }
+    }
+
+    if !checksum_candidates.is_empty() {
+        debug!("Sync: running parallel checksum on {} candidates", checksum_candidates.len());
+        parallel_checksum(
+            checksum_candidates,
+            config.num_checksum_workers(),
+            config.dry_run,
+            config.copy_xattrs,
+            &work_tx,
+            &stats,
+        )?;
     }
 
     debug!("Sync walk-worker finished: {:?}", thread::current().id());

@@ -101,6 +101,9 @@ fn opts_check(opts: &Opts) -> Result<()> {
     if opts.dry_run && !effective_sync {
         return Err(XcpError::InvalidArguments("--dry-run requires --sync or --sync-full".to_string()).into());
     }
+    if opts.checksum && !effective_sync {
+        return Err(XcpError::InvalidArguments("--checksum requires --sync or --sync-full".to_string()).into());
+    }
     Ok(())
 }
 

@@ -180,6 +180,18 @@ pub struct Config {
     /// `StatusUpdate::Notice` message; no files are created, modified, or
     /// deleted.
     pub dry_run: bool,
+
+    /// Use BLAKE3 checksum to verify file content in sync mode.
+    ///
+    /// When enabled, files whose metadata appears unchanged (same mtime, size,
+    /// and permissions) are also compared via their BLAKE3 hash. If the hashes
+    /// differ the file is copied. Only meaningful with `sync = true`.
+    pub checksum: bool,
+
+    /// Number of parallel workers for checksum computation.
+    ///
+    /// 0 means use the number of logical CPUs.
+    pub checksum_workers: usize,
 }
 
 impl Config {
@@ -188,6 +200,14 @@ impl Config {
             num_cpus::get()
         } else {
             self.workers
+        }
+    }
+
+    pub(crate) fn num_checksum_workers(&self) -> usize {
+        if self.checksum_workers == 0 {
+            num_cpus::get()
+        } else {
+            self.checksum_workers
         }
     }
 }
@@ -212,6 +232,8 @@ impl Default for Config {
             copy_special: false,
             copy_xattrs: false,
             dry_run: false,
+            checksum: false,
+            checksum_workers: 0,
         }
     }
 }
