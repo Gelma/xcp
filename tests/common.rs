@@ -1250,6 +1250,9 @@ fn test_sockets_dir(drv: &str) {
 #[cfg_attr(feature = "test_no_perms", ignore = "No FS support")]
 #[cfg_attr(feature = "test_no_root", ignore = "Not root compatible")]
 fn unreadable_file_error(drv: &str) {
+    if rustix::process::geteuid() == rustix::process::Uid::ROOT {
+        return; // root bypasses read-permission checks
+    }
     let dir = tempdir_rel().unwrap();
     let source_path = dir.path().join("source.txt");
     let dest_path = dir.path().join("dest.txt");
@@ -1276,6 +1279,9 @@ fn unreadable_file_error(drv: &str) {
 #[cfg_attr(feature = "test_no_perms", ignore = "No FS support")]
 #[cfg_attr(feature = "test_no_root", ignore = "Not root compatible")]
 fn dest_file_exists_not_writable(drv: &str) {
+    if rustix::process::geteuid() == rustix::process::Uid::ROOT {
+        return; // root bypasses write-permission checks
+    }
     let dir = tempdir_rel().unwrap();
     let source_path = dir.path().join("source.txt");
     let dest_path = dir.path().join("dest.txt");
