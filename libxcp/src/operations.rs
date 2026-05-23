@@ -292,17 +292,18 @@ fn compute_blake3(path: &Path) -> Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
-/// Compare a batch of (src, dst, size) file pairs by BLAKE3 hash in parallel,
-/// sending `Operation::Copy` for pairs whose content differs.
+/// Compare a batch of (src, dst, size, src_uid, src_gid) file pairs by BLAKE3
+/// hash in parallel, sending `Operation::Copy` for pairs whose content differs.
 fn parallel_checksum(
-    candidates: Vec<(PathBuf, PathBuf, u64)>,
+    candidates: Vec<(PathBuf, PathBuf, u64, u32, u32)>,
     nworkers: usize,
     dry_run: bool,
     copy_xattrs: bool,
+    ownership: bool,
     work_tx: &cbc::Sender<Operation>,
     stats: &Arc<dyn StatusUpdater>,
 ) -> Result<()> {
-    let (tx, rx) = cbc::unbounded::<(PathBuf, PathBuf, u64)>();
+    let (tx, rx) = cbc::unbounded::<(PathBuf, PathBuf, u64, u32, u32)>();
 
     let handles: Vec<_> = (0..nworkers)
         .map(|_| {
@@ -310,7 +311,7 @@ fn parallel_checksum(
             let wtx = work_tx.clone();
             let wstats = stats.clone();
             thread::spawn(move || -> Result<()> {
-                for (src, dst, size) in wrx {
+                for (src, dst, size, src_uid, src_gid) in wrx {
                     let src_hash = compute_blake3(&src)?;
                     let dst_hash = compute_blake3(&dst)?;
                     if src_hash != dst_hash {
@@ -327,9 +328,20 @@ fn parallel_checksum(
                         }
                     } else {
                         debug!("Sync: skip unchanged (checksum match) {:?}", src);
-                        if !dry_run && copy_xattrs {
-                            if let Err(e) = sync_xattrs(&src, &dst) {
-                                warn!("Failed to sync xattrs {:?}: {e}", src);
+                        if !dry_run {
+                            if ownership {
+                                if let Ok(dst_meta) = dst.symlink_metadata() {
+                                    if src_uid != dst_meta.uid() || src_gid != dst_meta.gid() {
+                                        if let Err(e) = chown(&dst, Some(src_uid), Some(src_gid)) {
+                                            warn!("Failed to sync ownership for {:?}: {e}", dst);
+                                        }
+                                    }
+                                }
+                            }
+                            if copy_xattrs {
+                                if let Err(e) = sync_xattrs(&src, &dst) {
+                                    warn!("Failed to sync xattrs {:?}: {e}", src);
+                                }
                             }
                         }
                     }
@@ -390,7 +402,8 @@ pub fn sync_walker(
     // Maps (dev, ino) of hard-linked source files to the first dest path written.
     let mut hardlink_map: HashMap<(u64, u64), PathBuf> = HashMap::new();
     // Files whose metadata matches but content must be verified with BLAKE3.
-    let mut checksum_candidates: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+    // Tuple: (src, dst, size, src_uid, src_gid)
+    let mut checksum_candidates: Vec<(PathBuf, PathBuf, u64, u32, u32)> = Vec::new();
     let gitignore = parse_ignore(source, config)?;
 
     for entry in WalkDir::new(source)
@@ -444,12 +457,23 @@ pub fn sync_walker(
                     }
                     Ok(_) => {} // already a directory
                 }
-                if !config.dry_run {
-                    if config.ownership {
-                        if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
+                if config.ownership {
+                    let owner_changed = match target.symlink_metadata() {
+                        Ok(m) => m.uid() != meta.uid() || m.gid() != meta.gid(),
+                        Err(_) => true,
+                    };
+                    if owner_changed {
+                        if config.dry_run {
+                            stats.send(StatusUpdate::Notice(format!(
+                                "would update ownership: {}",
+                                target.display()
+                            )))?;
+                        } else if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
                             warn!("Failed to copy directory ownership: {target:?}: {e}");
                         }
                     }
+                }
+                if !config.dry_run {
                     if !config.no_perms {
                         if let Ok(dst_meta) = target.symlink_metadata() {
                             if dst_meta.permissions() != meta.permissions() {
@@ -503,17 +527,18 @@ pub fn sync_walker(
                         // First occurrence of this inode: copy synchronously so
                         // subsequent occurrences can hard-link to it immediately.
                         hardlink_map.insert(key, target.clone());
-                        let should_copy = match target.symlink_metadata() {
-                            Err(_) => true,
+                        let (should_copy, hl_dst_meta) = match target.symlink_metadata() {
+                            Err(_) => (true, None),
                             Ok(dst_meta) => {
                                 if dst_meta.file_type().is_dir() {
                                     fs::remove_dir_all(&target)?;
-                                    true
+                                    (true, None)
                                 } else if dst_meta.file_type().is_symlink() {
                                     fs::remove_file(&target)?;
-                                    true
+                                    (true, None)
                                 } else {
-                                    needs_copy(&meta, &dst_meta, config)
+                                    let copy = needs_copy(&meta, &dst_meta, config);
+                                    (copy, Some(dst_meta))
                                 }
                             }
                         };
@@ -528,7 +553,7 @@ pub fn sync_walker(
                             if config.dry_run {
                                 stats.send(StatusUpdate::Notice(format!("would copy: {} -> {}", from.display(), target.display())))?;
                             } else {
-                                if let Ok(dst_meta) = target.symlink_metadata() {
+                                if let Some(ref dst_meta) = hl_dst_meta {
                                     if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
                                         let mut perms = dst_meta.permissions();
                                         perms.set_mode(dst_meta.mode() | 0o200);
@@ -541,6 +566,20 @@ pub fn sync_walker(
                                 hdl.copy_file(&stats)?;
                             }
                         } else {
+                            if config.ownership {
+                                if let Some(ref dst_meta) = hl_dst_meta {
+                                    if meta.uid() != dst_meta.uid() || meta.gid() != dst_meta.gid() {
+                                        if config.dry_run {
+                                            stats.send(StatusUpdate::Notice(format!(
+                                                "would update ownership: {}",
+                                                target.display()
+                                            )))?;
+                                        } else if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
+                                            warn!("Failed to sync ownership for {target:?}: {e}");
+                                        }
+                                    }
+                                }
+                            }
                             if !config.dry_run && config.copy_xattrs {
                                 if let Err(e) = sync_xattrs(&from, &target) {
                                     warn!("Failed to sync xattrs {from:?}: {e}");
@@ -551,17 +590,18 @@ pub fn sync_walker(
                     }
                 } else {
                     // Regular file (no hard-link preservation).
-                    let should_copy = match target.symlink_metadata() {
-                        Err(_) => true,
+                    let (should_copy, reg_dst_meta) = match target.symlink_metadata() {
+                        Err(_) => (true, None),
                         Ok(dst_meta) => {
                             if dst_meta.file_type().is_dir() {
                                 fs::remove_dir_all(&target)?;
-                                true
+                                (true, None)
                             } else if dst_meta.file_type().is_symlink() {
                                 fs::remove_file(&target)?;
-                                true
+                                (true, None)
                             } else {
-                                needs_copy(&meta, &dst_meta, config)
+                                let copy = needs_copy(&meta, &dst_meta, config);
+                                (copy, Some(dst_meta))
                             }
                         }
                     };
@@ -573,7 +613,7 @@ pub fn sync_walker(
                             // add the owner write bit so File::create() can
                             // overwrite it. copy_permissions() will restore the
                             // correct permissions once the copy is complete.
-                            if let Ok(dst_meta) = target.symlink_metadata() {
+                            if let Some(ref dst_meta) = reg_dst_meta {
                                 if dst_meta.is_file() && dst_meta.mode() & 0o200 == 0 {
                                     let mut perms = dst_meta.permissions();
                                     perms.set_mode(dst_meta.mode() | 0o200);
@@ -587,8 +627,22 @@ pub fn sync_walker(
                     } else if config.checksum {
                         // Defer content comparison to the parallel checksum phase.
                         debug!("Sync: defer checksum check {from:?}");
-                        checksum_candidates.push((from, target, meta.len()));
+                        checksum_candidates.push((from, target, meta.len(), meta.uid(), meta.gid()));
                     } else {
+                        if config.ownership {
+                            if let Some(ref dst_meta) = reg_dst_meta {
+                                if meta.uid() != dst_meta.uid() || meta.gid() != dst_meta.gid() {
+                                    if config.dry_run {
+                                        stats.send(StatusUpdate::Notice(format!(
+                                            "would update ownership: {}",
+                                            target.display()
+                                        )))?;
+                                    } else if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
+                                        warn!("Failed to sync ownership for {target:?}: {e}");
+                                    }
+                                }
+                            }
+                        }
                         if !config.dry_run && config.copy_xattrs {
                             if let Err(e) = sync_xattrs(&from, &target) {
                                 warn!("Failed to sync xattrs {from:?}: {e}");
@@ -712,6 +766,7 @@ pub fn sync_walker(
             config.num_checksum_workers(),
             config.dry_run,
             config.copy_xattrs,
+            config.ownership,
             &work_tx,
             &stats,
         )?;

@@ -2405,6 +2405,186 @@ fn sync_checksum_partial_mismatch() {
     assert!(file_contains(&dst.join("diff.txt"), "v1x").unwrap(), "diff.txt must be corrected");
 }
 
+// ===== --sync ownership-update tests =====
+
+/// In --sync --ownership mode, a file whose content/mtime/size/perms are
+/// unchanged but whose uid/gid differ must have ownership updated without
+/// re-copying (inode must not change).
+#[test]
+#[cfg_attr(not(feature = "test_run_root"), ignore = "Not root, skipping")]
+fn sync_ownership_updates_unchanged_file() {
+    if rustix::process::geteuid() != rustix::process::Uid::ROOT {
+        panic!("Process is not root");
+    }
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    let src_file = src.join("f.txt");
+    create_file(&src_file, "content").unwrap();
+
+    let out = run(&["--sync", "--ownership", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    // Change src ownership — chown does not alter mtime/size/perms, so
+    // needs_copy() will return false and only the ownership check must fire.
+    chown(&src_file, Some(1), Some(1)).unwrap();
+
+    let dst_file = dst.join("f.txt");
+    let inode_before = dst_file.metadata().unwrap().ino();
+
+    let out = run(&["--sync", "--ownership", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let dst_meta = dst_file.metadata().unwrap();
+    assert_eq!(dst_meta.uid(), 1, "dst uid must be updated to 1");
+    assert_eq!(dst_meta.gid(), 1, "dst gid must be updated to 1");
+    assert_eq!(dst_meta.ino(), inode_before, "file must not have been re-copied");
+}
+
+/// In --sync --ownership mode, a directory whose uid/gid differ from the source
+/// must have ownership updated without being recreated.
+#[test]
+#[cfg_attr(not(feature = "test_run_root"), ignore = "Not root, skipping")]
+fn sync_ownership_updates_dir() {
+    if rustix::process::geteuid() != rustix::process::Uid::ROOT {
+        panic!("Process is not root");
+    }
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "content").unwrap();
+
+    let out = run(&["--sync", "--ownership", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    chown(&src, Some(1), Some(1)).unwrap();
+
+    let out = run(&["--sync", "--ownership", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    let dst_meta = dst.metadata().unwrap();
+    assert_eq!(dst_meta.uid(), 1, "dst dir uid must be updated to 1");
+    assert_eq!(dst_meta.gid(), 1, "dst dir gid must be updated to 1");
+}
+
+/// --sync --ownership --dry-run must report "would update ownership" for a file
+/// whose uid/gid changed, without actually modifying the destination.
+#[test]
+#[cfg_attr(not(feature = "test_run_root"), ignore = "Not root, skipping")]
+fn sync_ownership_dry_run_reports_file() {
+    if rustix::process::geteuid() != rustix::process::Uid::ROOT {
+        panic!("Process is not root");
+    }
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    let src_file = src.join("f.txt");
+    create_file(&src_file, "content").unwrap();
+
+    let out = run(&["--sync", "--ownership", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    chown(&src_file, Some(1), Some(1)).unwrap();
+
+    let dst_file = dst.join("f.txt");
+    let uid_before = dst_file.metadata().unwrap().uid();
+
+    let out = run(&[
+        "--sync", "--ownership", "--dry-run",
+        src.to_str().unwrap(), dst.to_str().unwrap(),
+    ]).unwrap();
+    assert!(out.status.success());
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("would update ownership"),
+        "expected 'would update ownership' in stdout: {stdout}"
+    );
+    assert_eq!(
+        dst_file.metadata().unwrap().uid(), uid_before,
+        "dry-run must not change file ownership"
+    );
+}
+
+/// --sync --ownership --dry-run must report "would update ownership" for a
+/// directory whose uid/gid changed, without modifying the destination.
+#[test]
+#[cfg_attr(not(feature = "test_run_root"), ignore = "Not root, skipping")]
+fn sync_ownership_dry_run_reports_dir() {
+    if rustix::process::geteuid() != rustix::process::Uid::ROOT {
+        panic!("Process is not root");
+    }
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    create_file(&src.join("f.txt"), "content").unwrap();
+
+    let out = run(&["--sync", "--ownership", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    chown(&src, Some(1), Some(1)).unwrap();
+
+    let uid_before = dst.metadata().unwrap().uid();
+
+    let out = run(&[
+        "--sync", "--ownership", "--dry-run",
+        src.to_str().unwrap(), dst.to_str().unwrap(),
+    ]).unwrap();
+    assert!(out.status.success());
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("would update ownership"),
+        "expected 'would update ownership' in stdout: {stdout}"
+    );
+    assert_eq!(
+        dst.metadata().unwrap().uid(), uid_before,
+        "dry-run must not change dir ownership"
+    );
+}
+
+/// --sync --checksum --ownership: when hashes match (content identical) but
+/// uid/gid differ, ownership must be updated without re-copying the file.
+#[test]
+#[cfg_attr(not(feature = "test_run_root"), ignore = "Not root, skipping")]
+fn sync_checksum_updates_ownership_on_content_match() {
+    if rustix::process::geteuid() != rustix::process::Uid::ROOT {
+        panic!("Process is not root");
+    }
+    let dir = tempdir_rel().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    create_dir_all(&src).unwrap();
+    let src_file = src.join("f.txt");
+    create_file(&src_file, "content").unwrap();
+
+    let out = run(&["--sync", "--ownership", src.to_str().unwrap(), dst.to_str().unwrap()]).unwrap();
+    assert!(out.status.success());
+
+    // chown does not change mtime/size/perms, so needs_copy() returns false and
+    // the file enters the parallel_checksum path. Content is identical, so
+    // only the ownership update must fire.
+    chown(&src_file, Some(1), Some(1)).unwrap();
+
+    let dst_file = dst.join("f.txt");
+    let inode_before = dst_file.metadata().unwrap().ino();
+
+    let out = run(&[
+        "--sync", "--checksum", "--ownership",
+        src.to_str().unwrap(), dst.to_str().unwrap(),
+    ]).unwrap();
+    assert!(out.status.success());
+
+    let dst_meta = dst_file.metadata().unwrap();
+    assert_eq!(dst_meta.uid(), 1, "dst uid must be updated to 1 via checksum path");
+    assert_eq!(dst_meta.gid(), 1, "dst gid must be updated to 1 via checksum path");
+    assert_eq!(dst_meta.ino(), inode_before, "file must not have been re-copied");
+}
+
 /// --checksum + --hardlinks: a hard-linked file whose content was tampered must be re-copied.
 #[test]
 fn sync_checksum_detects_tampered_hardlinked_file() {
