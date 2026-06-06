@@ -137,8 +137,10 @@ impl CopyHandle {
         if !self.config.no_timestamps {
             copy_timestamps(&self.infd, &self.outfd)?;
         }
-        if self.config.ownership && copy_owner(&self.infd, &self.outfd).is_err() {
-            warn!("Failed to copy file ownership: {:?}", self.infd);
+        if self.config.ownership || self.config.sync {
+            if copy_owner(&self.infd, &self.outfd).is_err() && self.config.ownership {
+                warn!("Failed to copy file ownership: {:?}", self.infd);
+            }
         }
         if self.config.fsync {
             debug!("Syncing file {:?}", self.outfd);
@@ -300,6 +302,7 @@ fn parallel_checksum(
     dry_run: bool,
     copy_xattrs: bool,
     ownership: bool,
+    sync: bool,
     work_tx: &cbc::Sender<Operation>,
     stats: &Arc<dyn StatusUpdater>,
 ) -> Result<()> {
@@ -329,11 +332,13 @@ fn parallel_checksum(
                     } else {
                         debug!("Sync: skip unchanged (checksum match) {:?}", src);
                         if !dry_run {
-                            if ownership {
+                            if ownership || sync {
                                 if let Ok(dst_meta) = dst.symlink_metadata() {
                                     if src_uid != dst_meta.uid() || src_gid != dst_meta.gid() {
                                         if let Err(e) = chown(&dst, Some(src_uid), Some(src_gid)) {
-                                            warn!("Failed to sync ownership for {:?}: {e}", dst);
+                                            if ownership {
+                                                warn!("Failed to sync ownership for {:?}: {e}", dst);
+                                            }
                                         }
                                     }
                                 }
@@ -457,7 +462,7 @@ pub fn sync_walker(
                     }
                     Ok(_) => {} // already a directory
                 }
-                if config.ownership {
+                {
                     let owner_changed = match target.symlink_metadata() {
                         Ok(m) => m.uid() != meta.uid() || m.gid() != meta.gid(),
                         Err(_) => true,
@@ -469,7 +474,9 @@ pub fn sync_walker(
                                 target.display()
                             )))?;
                         } else if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
-                            warn!("Failed to copy directory ownership: {target:?}: {e}");
+                            if config.ownership {
+                                warn!("Failed to copy directory ownership: {target:?}: {e}");
+                            }
                         }
                     }
                 }
@@ -566,15 +573,15 @@ pub fn sync_walker(
                                 hdl.copy_file(&stats)?;
                             }
                         } else {
-                            if config.ownership {
-                                if let Some(ref dst_meta) = hl_dst_meta {
-                                    if meta.uid() != dst_meta.uid() || meta.gid() != dst_meta.gid() {
-                                        if config.dry_run {
-                                            stats.send(StatusUpdate::Notice(format!(
-                                                "would update ownership: {}",
-                                                target.display()
-                                            )))?;
-                                        } else if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
+                            if let Some(ref dst_meta) = hl_dst_meta {
+                                if meta.uid() != dst_meta.uid() || meta.gid() != dst_meta.gid() {
+                                    if config.dry_run {
+                                        stats.send(StatusUpdate::Notice(format!(
+                                            "would update ownership: {}",
+                                            target.display()
+                                        )))?;
+                                    } else if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
+                                        if config.ownership {
                                             warn!("Failed to sync ownership for {target:?}: {e}");
                                         }
                                     }
@@ -629,15 +636,15 @@ pub fn sync_walker(
                         debug!("Sync: defer checksum check {from:?}");
                         checksum_candidates.push((from, target, meta.len(), meta.uid(), meta.gid()));
                     } else {
-                        if config.ownership {
-                            if let Some(ref dst_meta) = reg_dst_meta {
-                                if meta.uid() != dst_meta.uid() || meta.gid() != dst_meta.gid() {
-                                    if config.dry_run {
-                                        stats.send(StatusUpdate::Notice(format!(
-                                            "would update ownership: {}",
-                                            target.display()
-                                        )))?;
-                                    } else if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
+                        if let Some(ref dst_meta) = reg_dst_meta {
+                            if meta.uid() != dst_meta.uid() || meta.gid() != dst_meta.gid() {
+                                if config.dry_run {
+                                    stats.send(StatusUpdate::Notice(format!(
+                                        "would update ownership: {}",
+                                        target.display()
+                                    )))?;
+                                } else if let Err(e) = chown(&target, Some(meta.uid()), Some(meta.gid())) {
+                                    if config.ownership {
                                         warn!("Failed to sync ownership for {target:?}: {e}");
                                     }
                                 }
@@ -767,6 +774,7 @@ pub fn sync_walker(
             config.dry_run,
             config.copy_xattrs,
             config.ownership,
+            config.sync,
             &work_tx,
             &stats,
         )?;
